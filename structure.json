@@ -1,0 +1,38 @@
+{
+  "bpm": 128,
+  "time_signature": [4, 4],
+  "structure": [
+    {"section": "intro",     "bars": 8},
+    {"section": "build",     "bars": 8},
+    {"section": "drop",      "bars": 16},
+    {"section": "breakdown", "bars": 8},
+    {"section": "build",     "bars": 8},
+    {"section": "drop",      "bars": 16},
+    {"section": "outro",     "bars": 8}
+  ],
+  "automations": [
+    {
+      "track": "1-Synth Lead",
+      "parameter_pointee": 22278,
+      "points": [
+        {"bar": 1,  "value": 0.0},
+        {"bar": 9,  "value": 0.5},
+        {"bar": 17, "value": 1.0},
+        {"bar": 33, "value": 0.3},
+        {"bar": 41, "value": 1.0},
+        {"bar": 57, "value": 0.0}
+      ]
+    },
+    {
+      "track": "2-Bass",
+      "parameter_pointee": 22301,
+      "points": [
+        {"bar": 1,  "value": 0.0},
+        {"bar": 17, "value": 0.85},
+        {"bar": 33, "value": 0.0},
+        {"bar": 41, "value": 0.85},
+        {"bar": 57, "value": 0.0}
+      ]
+    }
+  ]
+}

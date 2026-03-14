@@ -65,6 +65,14 @@ def set_bpm(xml_str, bpm):
     return re.sub(r'(<Tempo>.*?<Manual Value=")[^"]*(")',
                   rf'\g<1>{bpm}\2', xml_str, count=1, flags=re.DOTALL)
 
+def increment_overwrite_protection(xml_str):
+    m = re.search(r'OverwriteProtectionNumber Value="(\d+)"', xml_str)
+    if m:
+        new_val = int(m.group(1)) + 1
+        return re.sub(r'(<OverwriteProtectionNumber Value=")[^"]*(")',
+                      rf'\g<1>{new_val}\2', xml_str, count=1)
+    return xml_str
+
 def find_any_clip(track_el):
     """Find any MidiClip in the track — session or arrangement."""
     # Try session slots first
@@ -89,19 +97,27 @@ def make_arrangement_clip(source_el, start_beat, length_beats, clip_id,
     clip.set('Id', str(clip_id))
     clip.set('Time', str(start_beat))
 
-    # Clip extent
+    # Clip extent — stretch to cover the full arrangement
     clip.find('CurrentStart').set('Value', '0')
     clip.find('CurrentEnd').set('Value', str(length_beats))
 
-    # Loop region
+    # Loop region — preserve the source loop size so the pattern repeats.
+    # Only CurrentEnd is extended; LoopEnd/OutMarker stay at the original
+    # clip length so Ableton loops the note content rather than playing silence.
     loop = clip.find('Loop')
+    loop_end = float(loop.find('LoopEnd').get('Value'))
     loop.find('LoopStart').set('Value', '0')
-    loop.find('LoopEnd').set('Value', str(length_beats))
-    loop.find('OutMarker').set('Value', str(length_beats))
+    loop.find('OutMarker').set('Value', str(loop_end))
     loop.find('HiddenLoopStart').set('Value', '0')
-    loop.find('HiddenLoopEnd').set('Value', str(length_beats))
     loop.find('StartRelative').set('Value', '0')
     loop.find('LoopOn').set('Value', 'true')
+
+    # Fix clip editor scroll state to match clip length
+    scroller = clip.find('ScrollerTimePreserver')
+    if scroller is not None:
+        rt = scroller.find('RightTime')
+        if rt is not None:
+            rt.set('Value', str(length_beats))
 
     # Remove/rebuild Envelopes
     env_outer = clip.find('Envelopes')
@@ -146,6 +162,22 @@ def make_arrangement_clip(source_el, start_beat, length_beats, clip_id,
     return clip
 
 
+# ── Locator builder ───────────────────────────────────────────────────────────
+
+def build_locators(sections_info):
+    """Return a <Locators> element containing one locator per section start."""
+    outer = ET.Element('Locators')
+    inner = ET.SubElement(outer, 'Locators')
+    for i, sec in enumerate(sections_info):
+        loc = ET.SubElement(inner, 'Locator', Id=str(i))
+        ET.SubElement(loc, 'LomId', Value='0')
+        ET.SubElement(loc, 'Time', Value=str(sec['start']))
+        ET.SubElement(loc, 'Name', Value=sec['name'])
+        ET.SubElement(loc, 'Annotation', Value='')
+        ET.SubElement(loc, 'IsSongStart', Value='false')
+    return outer
+
+
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def build_arrangement(cfg, base_als_path, output_als_path):
@@ -163,13 +195,10 @@ def build_arrangement(cfg, base_als_path, output_als_path):
     # Index tracks by name
     track_by_name = {t.find('.//EffectiveName').get('Value'): t for t in tracks}
 
-    # Source clip template — from first MIDI track
+    # Verify at least one MIDI track has a clip
     t0 = next(t for t in tracks if t.tag == 'MidiTrack')
-    source_clip = find_any_clip(t0)
-    if source_clip is None:
+    if find_any_clip(t0) is None:
         raise ValueError("No MIDI clip found in the file to use as source template")
-    print(f"Source clip: {source_clip.find('Name').get('Value')!r}, "
-          f"notes={len(source_clip.findall('.//MidiNoteEvent'))}")
 
     # Compute section positions
     sections_info = []
@@ -203,6 +232,10 @@ def build_arrangement(cfg, base_als_path, output_als_path):
         if events_el is None:
             continue
 
+        source_clip = find_any_clip(t)
+        if source_clip is None:
+            continue
+
         # Clear existing arrangement clips
         for child in list(events_el):
             events_el.remove(child)
@@ -219,11 +252,23 @@ def build_arrangement(cfg, base_als_path, output_als_path):
         )
         clip_id += 1
         events_el.append(arr_clip)
+        print(f"  {tname}: {len(source_clip.findall('.//MidiNoteEvent'))} notes")
+
+    # Write locators
+    locators_el = root.find('LiveSet/Locators')
+    if locators_el is not None:
+        locators_el.getparent() if hasattr(locators_el, 'getparent') else None
+        new_locators = build_locators(sections_info)
+        live_set = root.find('LiveSet')
+        idx = list(live_set).index(locators_el)
+        live_set.remove(locators_el)
+        live_set.insert(idx, new_locators)
 
     # Write out
     new_xml = '<?xml version="1.0" encoding="UTF-8"?>\n' + ET.tostring(root, encoding='unicode')
     new_xml = set_bpm(new_xml, bpm)
     new_xml = set_next_id(new_xml, clip_id)
+    new_xml = increment_overwrite_protection(new_xml)
 
     with gzip.open(output_als_path, 'wb') as f:
         f.write(new_xml.encode('utf-8'))
