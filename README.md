@@ -11,6 +11,7 @@ A command-line tool that builds an Ableton Live arrangement from a JSON song str
 
 ```
 python3 arrangement_tool.py structure.json base.als output.als
+python3 arrangement_tool.py --xml base.als
 ```
 
 | Argument | Description |
@@ -18,6 +19,7 @@ python3 arrangement_tool.py structure.json base.als output.als
 | `structure.json` | Song structure and automation config |
 | `base.als` | Source project containing one MIDI clip per track |
 | `output.als` | Path for the generated arrangement |
+| `--xml ALS` | Decompress a `.als` to readable XML and exit — useful for finding `parameter_pointee` IDs |
 
 ## structure.json
 
@@ -55,6 +57,7 @@ python3 arrangement_tool.py structure.json base.als output.als
 |---|---|
 | `bpm` | Project tempo |
 | `time_signature` | `[beats_per_bar, beat_unit]` — only `beats_per_bar` is currently used |
+| `track_height` | Arrangement lane height in pixels, 17–425 (default: `68`) |
 | `structure[].section` | Section name — used as the arrangement marker label |
 | `structure[].bars` | Length of the section in bars |
 | `automations[].track` | Must exactly match the `EffectiveName` of a MIDI track in the `.als` |
@@ -77,17 +80,14 @@ Each MIDI track that should appear in the arrangement needs at least one MIDI cl
 
 ## Finding parameter_pointee IDs
 
-To automate a parameter, you need its `Pointee Id` from the `.als` XML:
+Use `--xml` to dump a readable copy of any `.als`, then search it for the parameter name:
 
 ```bash
-# Decompress the .als and search for the parameter name
-python3 -c "
-import gzip
-print(gzip.open('base.als','rb').read().decode('utf-8'))
-" | grep -i "FilterFreq" | head -20
+python3 arrangement_tool.py --xml base.als
+grep -i "FilterFreq" base.xml | head -20
 ```
 
-Look for `<AutomationTarget Id="...">` or `<ModulationTarget Id="...">` adjacent to the parameter element — that `Id` value is the `parameter_pointee`.
+Look for `<AutomationTarget Id="...">` or `<ModulationTarget Id="...">` adjacent to the parameter — that `Id` is the `parameter_pointee`.
 
 ## Output
 

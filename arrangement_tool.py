@@ -5,14 +5,16 @@ Build an Ableton arrangement from a JSON song structure.
 
 Usage:
     python3 arrangement_tool.py structure.json base.als output.als
+    python3 arrangement_tool.py --xml base.als          # dump XML for inspection
 
 The base .als must contain at least one clip somewhere (session or arrangement)
-on the first MIDI track — that clip is used as the loop source template.
+on each MIDI track.
 
 JSON format:
 {
   "bpm": 130,
   "time_signature": [4, 4],
+  "track_height": 68,
   "structure": [
     {"section": "intro",     "bars": 8},
     {"section": "build",     "bars": 8},
@@ -35,11 +37,13 @@ JSON format:
 }
 
 parameter_pointee: the ModulationTarget/Pointee Id of the parameter.
+  Use --xml to dump a .als to readable XML to find these IDs.
 values: normalised 0.0–1.0.
 bars: 1-indexed from start of song.
+track_height: arrangement lane height in pixels (17–425, default 68).
 """
 
-import gzip, re, json, sys, copy
+import gzip, re, json, sys, copy, argparse
 import xml.etree.ElementTree as ET
 
 
@@ -61,9 +65,22 @@ def set_next_id(xml_str, value):
     return re.sub(r'(<NextPointeeId Value=")[^"]*(")', rf'\g<1>{value}\2',
                   xml_str, count=1)
 
-def set_bpm(xml_str, bpm):
-    return re.sub(r'(<Tempo>.*?<Manual Value=")[^"]*(")',
-                  rf'\g<1>{bpm}\2', xml_str, count=1, flags=re.DOTALL)
+def set_bpm(root, bpm):
+    """Set BPM on the XML tree. Handles Live 12 (MainTrack), v10+ (MasterTrack), and legacy."""
+    # Live 12: MainTrack > DeviceChain > Mixer > Tempo > Manual
+    # Live 10/11: MasterTrack > DeviceChain > Mixer > Tempo > Manual
+    for track_tag in ('MainTrack', 'MasterTrack'):
+        manual = root.find(f'.//{track_tag}/DeviceChain/Mixer/Tempo/Manual')
+        if manual is not None:
+            manual.set('Value', str(bpm))
+            return
+    # Legacy (pre-v10): BPM stored as a FloatEvent under Tempo > ArrangerAutomation
+    for track_tag in ('MainTrack', 'MasterTrack'):
+        float_event = root.find(
+            f'.//{track_tag}/DeviceChain/Mixer/Tempo/ArrangerAutomation/Events/FloatEvent')
+        if float_event is not None:
+            float_event.set('Value', str(bpm))
+            return
 
 def increment_overwrite_protection(xml_str):
     m = re.search(r'OverwriteProtectionNumber Value="(\d+)"', xml_str)
@@ -72,6 +89,16 @@ def increment_overwrite_protection(xml_str):
         return re.sub(r'(<OverwriteProtectionNumber Value=")[^"]*(")',
                       rf'\g<1>{new_val}\2', xml_str, count=1)
     return xml_str
+
+def set_track_heights(tracks, height):
+    """Set arrangement LaneHeight on all MIDI tracks (clamped 17–425)."""
+    height = max(17, min(425, height))
+    for t in tracks:
+        if t.tag != 'MidiTrack':
+            continue
+        lh = t.find('LaneHeight')
+        if lh is not None:
+            lh.set('Value', str(height))
 
 def find_any_clip(track_el):
     """Find any MidiClip in the track — session or arrangement."""
@@ -183,6 +210,7 @@ def build_locators(sections_info):
 def build_arrangement(cfg, base_als_path, output_als_path):
     bpm            = cfg.get('bpm', 120)
     beats_per_bar  = cfg.get('time_signature', [4, 4])[0]
+    track_height   = cfg.get('track_height', 68)
     sections       = cfg['structure']
     auto_specs     = cfg.get('automations', [])
 
@@ -264,9 +292,12 @@ def build_arrangement(cfg, base_als_path, output_als_path):
         live_set.remove(locators_el)
         live_set.insert(idx, new_locators)
 
+    # Track heights and BPM (tree operations before serialisation)
+    set_track_heights(tracks, track_height)
+    set_bpm(root, bpm)
+
     # Write out
     new_xml = '<?xml version="1.0" encoding="UTF-8"?>\n' + ET.tostring(root, encoding='unicode')
-    new_xml = set_bpm(new_xml, bpm)
     new_xml = set_next_id(new_xml, clip_id)
     new_xml = increment_overwrite_protection(new_xml)
 
@@ -286,9 +317,29 @@ def build_arrangement(cfg, base_als_path, output_als_path):
 
 
 if __name__ == '__main__':
-    if len(sys.argv) != 4:
-        print(__doc__)
+    parser = argparse.ArgumentParser(
+        description='Build an Ableton arrangement from a JSON structure file.',
+        epilog='Use --xml to inspect a .als and find parameter_pointee IDs.')
+    parser.add_argument('--xml', metavar='ALS',
+                        help='Dump uncompressed XML from ALS to <name>.xml and exit')
+    parser.add_argument('structure', nargs='?', help='JSON structure file')
+    parser.add_argument('base',      nargs='?', help='Base .als project file')
+    parser.add_argument('output',    nargs='?', help='Output .als path')
+    args = parser.parse_args()
+
+    if args.xml:
+        with gzip.open(args.xml, 'rb') as f:
+            xml_bytes = f.read()
+        out_path = re.sub(r'\.als$', '', args.xml, flags=re.IGNORECASE) + '.xml'
+        with open(out_path, 'wb') as f:
+            f.write(xml_bytes)
+        print(f"XML written to {out_path}")
+        sys.exit(0)
+
+    if not all([args.structure, args.base, args.output]):
+        parser.print_help()
         sys.exit(1)
-    with open(sys.argv[1]) as f:
+
+    with open(args.structure) as f:
         cfg = json.load(f)
-    build_arrangement(cfg, sys.argv[2], sys.argv[3])
+    build_arrangement(cfg, args.base, args.output)
