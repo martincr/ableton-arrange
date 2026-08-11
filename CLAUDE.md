@@ -5,14 +5,17 @@ Builds an Ableton Live arrangement from a JSON song structure file.
 ## Usage
 
 ```
-python3 arrangement_tool.py structure.json base.als output.als
+python3 arrangement_tool.py structure.json base.als output.als [--backup]
 python3 arrangement_tool.py --xml base.als
+python3 arrangement_tool.py --inspect base.als [track]
 ```
 
 - `structure.json` — song structure and automation config
 - `base.als` — source Ableton project; must contain at least one MIDI clip per MIDI track
 - `output.als` — path for the generated arrangement file
+- `--backup` — if `output.als` already exists, copy it to `output.als.backup` before overwriting
 - `--xml ALS` — decompress a `.als` to readable XML for inspection (e.g. finding `parameter_pointee` IDs)
+- `--inspect ALS [track]` — print a structured summary: BPM, tracks, session clips and bar lengths, and arrangement status; pass a track name to instead list its automatable parameters (device, parameter, target id, current value, range) and Send target ids
 
 ## structure.json format
 
@@ -35,6 +38,18 @@ python3 arrangement_tool.py --xml base.als
         {"bar": 17, "value": 1.0}
       ]
     }
+  ],
+  "track_segments": {
+    "2-DS Kick": [[1, 9], [17, 25]]
+  },
+  "send_throws": [
+    {
+      "send_index": 0,
+      "points": [
+        {"bar": 17, "value": 0.9},
+        {"bar": 19, "value": 0.05}
+      ]
+    }
   ]
 }
 ```
@@ -52,16 +67,20 @@ python3 arrangement_tool.py --xml base.als
 | `automations[].parameter_pointee` | `ModulationTarget` / `Pointee` Id of the target parameter |
 | `automations[].points[].bar` | 1-indexed bar number from song start |
 | `automations[].points[].value` | Normalised `0.0–1.0` |
+| `track_segments` | Optional. Maps a track name to a list of `[start_bar, end_bar)` ranges (end exclusive) — that track gets one looping clip per range instead of one clip spanning the whole song, so it can drop in/out. Tracks not listed keep the default full-length behavior |
+| `send_throws[].send_index` | 0-indexed Send slot; applies the same automation `points` to that Send on every track that has one, without listing a `parameter_pointee` per track |
+| `send_throws[].points` | Same `{bar, value}` shape as `automations[].points` |
 
 ## How it works
 
 1. Reads and decompresses the base `.als` (gzip XML)
 2. For each MIDI track, uses that track's own clip as the source template
-3. Places a single clip per track spanning the full arrangement length, looping the source pattern
-4. Injects clip-level automation envelopes for tracks listed in `automations`
+3. Places one looping clip per track spanning the full arrangement length by default, or one clip per `track_segments` range for tracks that have segments
+4. Injects clip-level automation envelopes for tracks listed in `automations`, plus any `send_throws` (filtered and re-anchored to clip-relative time for segmented tracks)
 5. Writes named markers at each section boundary
 6. Sets BPM (handles Live 12 `MainTrack`, Live 10/11 `MasterTrack`, and pre-v10 legacy paths)
-7. Writes the output `.als`
+7. Optionally backs up an existing `output.als` to `output.als.backup` (`--backup`)
+8. Writes the output `.als`
 
 ## base.als requirements
 
@@ -81,6 +100,12 @@ python3 arrangement_tool.py --xml base.als
 ## Finding parameter_pointee IDs
 
 ```
+python3 arrangement_tool.py --inspect base.als 1-Analog
+```
+
+or manually:
+
+```
 python3 arrangement_tool.py --xml base.als
 grep -i "ParameterName" base.xml
 ```
@@ -95,3 +120,5 @@ Look for `<AutomationTarget Id="...">` or `<ModulationTarget Id="...">` adjacent
 - `OverwriteProtectionNumber` is incremented in the output so Ableton detects the file as modified and reloads the arrangement view correctly
 - Section markers are written to `LiveSet/Locators/Locators` at each section's start beat
 - `track_height` sets `LaneHeight` directly on track elements — effective on Live ≤11; no-ops silently on Live 12 where height is stored elsewhere
+- `automations[].points` and `send_throws[].points` use global song bar numbers. For a track with `track_segments`, points outside a given segment's bar range don't apply to that segment's clip — there's no interpolation across the gap, so add explicit points near each segment boundary if you need a specific value there
+- `--backup` only triggers when the output path already exists — the first run to a new path never creates a `.backup` file
