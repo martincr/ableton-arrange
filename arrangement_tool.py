@@ -171,12 +171,15 @@ def get_automation_params(track_el):
         if not target_id:
             continue
         manual_el = param_el.find('Manual')
-        min_el = param_el.find('Min')
+        range_el = param_el.find('MidiControllerRange')
+        if range_el is None:
+            range_el = param_el
+        min_el = range_el.find('Min')
         if min_el is None:
-            min_el = param_el.find('MinValue')
-        max_el = param_el.find('Max')
+            min_el = range_el.find('MinValue')
+        max_el = range_el.find('Max')
         if max_el is None:
-            max_el = param_el.find('MaxValue')
+            max_el = range_el.find('MaxValue')
 
         device_el = parent_map.get(param_el)
         device_name = device_el.tag if device_el is not None else None
