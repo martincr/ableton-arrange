@@ -4,8 +4,9 @@ arrangement_tool.py
 Build an Ableton arrangement from a JSON song structure.
 
 Usage:
-    python3 arrangement_tool.py structure.json base.als output.als
-    python3 arrangement_tool.py --xml base.als          # dump XML for inspection
+    python3 arrangement_tool.py structure.json base.als output.als [--backup]
+    python3 arrangement_tool.py --xml base.als                    # dump XML for inspection
+    python3 arrangement_tool.py --inspect base.als [track]        # structured track/parameter summary
 
 The base .als must contain at least one clip somewhere (session or arrangement)
 on each MIDI track.
@@ -33,17 +34,36 @@ JSON format:
         {"bar": 33, "value": 0.05}
       ]
     }
+  ],
+  "track_segments": {
+    "2-DS Kick": [[1, 49], [65, 97]]
+  },
+  "send_throws": [
+    {
+      "send_index": 0,
+      "points": [
+        {"bar": 49, "value": 0.9},
+        {"bar": 51, "value": 0.05}
+      ]
+    }
   ]
 }
 
 parameter_pointee: the ModulationTarget/Pointee Id of the parameter.
-  Use --xml to dump a .als to readable XML to find these IDs.
+  Use --xml or --inspect to find these IDs.
 values: normalised 0.0–1.0.
 bars: 1-indexed from start of song.
 track_height: arrangement lane height in pixels (17–425, default 68).
+track_segments: optional. Tracks not listed get one clip spanning the whole
+  arrangement (default behaviour). Listed tracks instead get one looping clip
+  per [start_bar, end_bar) range, so they can drop in/out of the song —
+  end_bar is exclusive, e.g. [[1, 49], [65, 97]] covers bars 1-48 and 65-96.
+send_throws: optional. Applies the same automation points to the Nth Send
+  (0-indexed) on every track that has one, without listing a parameter_pointee
+  per track — e.g. a reverb "dub throw" spike across the whole song at once.
 """
 
-import gzip, re, json, sys, copy, argparse
+import gzip, re, json, sys, copy, argparse, os, shutil
 import xml.etree.ElementTree as ET
 
 
@@ -109,6 +129,136 @@ def find_any_clip(track_el):
     for clip in track_el.findall('.//ClipTimeable/ArrangerAutomation/Events/MidiClip'):
         return clip
     return None
+
+def get_send_pointee(track_el, send_index):
+    """Return the AutomationTarget Id of the track's Nth Send, or None."""
+    holders = track_el.findall('.//Sends/TrackSendHolder')
+    if send_index >= len(holders):
+        return None
+    at = holders[send_index].find('Send/AutomationTarget')
+    return int(at.get('Id')) if at is not None else None
+
+
+# ── Inspection ───────────────────────────────────────────────────────────────
+
+def get_bpm_value(root):
+    tempo = root.find('.//Tempo/Manual')
+    return float(tempo.get('Value', 120)) if tempo is not None else 120.0
+
+def get_session_clips(track_el):
+    """Summarise session-view clips (name, bars) on a track."""
+    clips = []
+    for tag, ttype in (('MidiClip', 'MIDI'), ('AudioClip', 'audio')):
+        for clip_el in track_el.findall(f'.//MainSequencer/ClipSlotList//{tag}'):
+            name_el = clip_el.find('Name')
+            name = name_el.get('Value', '') if name_el is not None else ''
+            loop = clip_el.find('Loop')
+            if loop is not None:
+                length_beats = (float(loop.find('LoopEnd').get('Value'))
+                                 - float(loop.find('LoopStart').get('Value')))
+            else:
+                length_beats = 4.0
+            clips.append({'name': name or f'{ttype} clip', 'bars': length_beats / 4.0})
+    return clips
+
+def get_automation_params(track_el):
+    """Find automatable parameters: elements with a direct AutomationTarget child."""
+    parent_map = {child: parent for parent in track_el.iter() for child in parent}
+    params = []
+    for param_el in track_el.findall('.//*[AutomationTarget]'):
+        at = param_el.find('AutomationTarget')
+        target_id = at.get('Id') if at is not None else None
+        if not target_id:
+            continue
+        manual_el = param_el.find('Manual')
+        min_el = param_el.find('Min')
+        if min_el is None:
+            min_el = param_el.find('MinValue')
+        max_el = param_el.find('Max')
+        if max_el is None:
+            max_el = param_el.find('MaxValue')
+
+        device_el = parent_map.get(param_el)
+        device_name = device_el.tag if device_el is not None else None
+        if device_el is not None:
+            username_el = device_el.find('UserName')
+            if username_el is not None and username_el.get('Value'):
+                device_name = username_el.get('Value')
+
+        params.append({
+            'device': device_name,
+            'parameter': param_el.tag,
+            'target_id': target_id,
+            'manual': manual_el.get('Value') if manual_el is not None else None,
+            'min': min_el.get('Value') if min_el is not None else None,
+            'max': max_el.get('Value') if max_el is not None else None,
+        })
+    return params
+
+def get_send_info(track_el):
+    sends = []
+    for i, holder in enumerate(track_el.findall('.//Sends/TrackSendHolder')):
+        send_el = holder.find('Send')
+        if send_el is None:
+            continue
+        at = send_el.find('AutomationTarget')
+        manual_el = send_el.find('Manual')
+        sends.append({
+            'send_index': i,
+            'target_id': at.get('Id') if at is not None else None,
+            'manual': manual_el.get('Value') if manual_el is not None else None,
+        })
+    return sends
+
+def print_inspect_report(root, track_filter=None):
+    tracks = root.find('LiveSet/Tracks')
+
+    if track_filter:
+        target = next((t for t in tracks
+                       if t.find('.//EffectiveName') is not None
+                       and t.find('.//EffectiveName').get('Value') == track_filter), None)
+        if target is None:
+            print(f"Track '{track_filter}' not found.")
+            return
+
+        print(f"Track: {track_filter}\n")
+        params = get_automation_params(target)
+        if params:
+            for p in params:
+                range_str = f" range=[{p['min']}, {p['max']}]" if p['min'] and p['max'] else ''
+                dev = f"{p['device']} / " if p['device'] else ''
+                print(f"  {dev}{p['parameter']}: target={p['target_id']} manual={p['manual']}{range_str}")
+        else:
+            print("  No automatable parameters found.")
+
+        sends = get_send_info(target)
+        if sends:
+            print()
+            for s in sends:
+                print(f"  Send {s['send_index']}: target={s['target_id']} manual={s['manual']}")
+        return
+
+    bpm = get_bpm_value(root)
+    print(f"BPM: {bpm}\n")
+    print(f"{'Track':<20} {'Clip':<25} {'Bars'}")
+    print('-' * 55)
+    for t in tracks:
+        if t.tag not in ('MidiTrack', 'AudioTrack', 'ReturnTrack', 'GroupTrack'):
+            continue
+        name_el = t.find('.//EffectiveName')
+        name = name_el.get('Value', 'Unknown') if name_el is not None else 'Unknown'
+        ttype = {'MidiTrack': 'MIDI', 'AudioTrack': 'audio'}.get(t.tag, t.tag.replace('Track', ''))
+        clips = get_session_clips(t)
+        arranged = bool(t.findall('.//ClipTimeable/ArrangerAutomation/Events/MidiClip')
+                         or t.findall('.//ClipTimeable/ArrangerAutomation/Events/AudioClip'))
+
+        if clips:
+            for i, c in enumerate(clips):
+                print(f"{(name if i == 0 else ''):<20} {c['name'] + ' ' + ttype:<25} {c['bars']:.1f} bars")
+        else:
+            print(f"{name:<20} {'(no session clips)':<25}")
+        if arranged:
+            print(f"{'':<20} (arrangement already populated)")
 
 
 # ── Clip builder ──────────────────────────────────────────────────────────────
@@ -207,12 +357,14 @@ def build_locators(sections_info):
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 
-def build_arrangement(cfg, base_als_path, output_als_path):
+def build_arrangement(cfg, base_als_path, output_als_path, backup=False):
     bpm            = cfg.get('bpm', 120)
     beats_per_bar  = cfg.get('time_signature', [4, 4])[0]
     track_height   = cfg.get('track_height', 68)
     sections       = cfg['structure']
     auto_specs     = cfg.get('automations', [])
+    track_segments = cfg.get('track_segments', {})
+    send_throws    = cfg.get('send_throws', [])
 
     with gzip.open(base_als_path, 'rb') as f:
         als_xml = f.read().decode('utf-8')
@@ -268,18 +420,55 @@ def build_arrangement(cfg, base_als_path, output_als_path):
         for child in list(events_el):
             events_el.remove(child)
 
-        automations = auto_by_track.get(tname, {}) or None
+        track_automations = dict(auto_by_track.get(tname, {}))
 
-        # Single clip spanning full arrangement
-        arr_clip = make_arrangement_clip(
-            source_clip,
-            start_beat=0,
-            length_beats=total_beats,
-            clip_id=clip_id,
-            automations=automations,
-        )
-        clip_id += 1
-        events_el.append(arr_clip)
+        # Send-throw convenience: same points on this track's Nth Send, for every
+        # track that has one.
+        for spec in send_throws:
+            pointee = get_send_pointee(t, spec['send_index'])
+            if pointee is None:
+                continue
+            track_automations[pointee] = [
+                {'beat': (pt['bar'] - 1) * beats_per_bar, 'value': pt['value']}
+                for pt in spec['points']
+            ]
+
+        segments = track_segments.get(tname)
+        if segments:
+            # One looping clip per [start_bar, end_bar) range, so the track can
+            # drop in/out of the arrangement instead of playing the whole song.
+            for start_bar, end_bar in segments:
+                seg_start = (start_bar - 1) * beats_per_bar
+                seg_end   = (end_bar - 1) * beats_per_bar
+                seg_automations = {}
+                for pointee, pts in track_automations.items():
+                    seg_pts = [
+                        {'beat': pt['beat'] - seg_start, 'value': pt['value']}
+                        for pt in pts if seg_start <= pt['beat'] < seg_end
+                    ]
+                    if seg_pts:
+                        seg_automations[pointee] = seg_pts
+
+                arr_clip = make_arrangement_clip(
+                    source_clip,
+                    start_beat=seg_start,
+                    length_beats=seg_end - seg_start,
+                    clip_id=clip_id,
+                    automations=seg_automations or None,
+                )
+                clip_id += 1
+                events_el.append(arr_clip)
+        else:
+            # Single clip spanning full arrangement
+            arr_clip = make_arrangement_clip(
+                source_clip,
+                start_beat=0,
+                length_beats=total_beats,
+                clip_id=clip_id,
+                automations=track_automations or None,
+            )
+            clip_id += 1
+            events_el.append(arr_clip)
         print(f"  {tname}: {len(source_clip.findall('.//MidiNoteEvent'))} notes")
 
     # Write locators
@@ -301,6 +490,11 @@ def build_arrangement(cfg, base_als_path, output_als_path):
     new_xml = set_next_id(new_xml, clip_id)
     new_xml = increment_overwrite_protection(new_xml)
 
+    if backup and os.path.exists(output_als_path):
+        backup_path = output_als_path + '.backup'
+        shutil.copy2(output_als_path, backup_path)
+        print(f"Backup written: {backup_path}")
+
     with gzip.open(output_als_path, 'wb') as f:
         f.write(new_xml.encode('utf-8'))
 
@@ -313,15 +507,24 @@ def build_arrangement(cfg, base_als_path, output_als_path):
         print(f"  {s['name']:12}  bars {b1:.0f}–{b2:.0f}  ({s['length']:.0f} beats from beat {s['start']})")
     if auto_by_track:
         print(f"\nAutomation written for: {list(auto_by_track.keys())}")
+    if track_segments:
+        print(f"Segmented tracks: {list(track_segments.keys())}")
+    if send_throws:
+        print(f"Send-throw automation on send index(es): {[s['send_index'] for s in send_throws]}")
     print(f"\nOutput: {output_als_path}")
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
         description='Build an Ableton arrangement from a JSON structure file.',
-        epilog='Use --xml to inspect a .als and find parameter_pointee IDs.')
+        epilog='Use --xml or --inspect to find parameter_pointee IDs.')
     parser.add_argument('--xml', metavar='ALS',
                         help='Dump uncompressed XML from ALS to <name>.xml and exit')
+    parser.add_argument('--inspect', nargs='+', metavar=('ALS', 'TRACK'),
+                        help='Print a track/clip/automation-parameter summary and exit; '
+                             'optionally filter to one TRACK')
+    parser.add_argument('--backup', action='store_true',
+                        help='Back up an existing output file to <output>.backup before overwriting')
     parser.add_argument('structure', nargs='?', help='JSON structure file')
     parser.add_argument('base',      nargs='?', help='Base .als project file')
     parser.add_argument('output',    nargs='?', help='Output .als path')
@@ -336,10 +539,18 @@ if __name__ == '__main__':
         print(f"XML written to {out_path}")
         sys.exit(0)
 
+    if args.inspect:
+        als_path = args.inspect[0]
+        track_filter = args.inspect[1] if len(args.inspect) > 1 else None
+        with gzip.open(als_path, 'rb') as f:
+            inspect_root = ET.fromstring(f.read().decode('utf-8'))
+        print_inspect_report(inspect_root, track_filter)
+        sys.exit(0)
+
     if not all([args.structure, args.base, args.output]):
         parser.print_help()
         sys.exit(1)
 
     with open(args.structure) as f:
         cfg = json.load(f)
-    build_arrangement(cfg, args.base, args.output)
+    build_arrangement(cfg, args.base, args.output, backup=args.backup)
