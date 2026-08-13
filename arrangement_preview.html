@@ -1,0 +1,583 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Arrangement Preview</title>
+<style>
+  :root {
+    --bg-page:        #0a0a0c;
+    --bg-panel:       #16161a;
+    --bg-header:      #1c1c21;
+    --bg-row:         #1a1a1f;
+    --bg-row-alt:     #19191d;
+    --line:           #2b2b31;
+    --line-strong:    #3a3a42;
+    --text-primary:   #f2f0eb;
+    --text-secondary: #a7a5ad;
+    --text-muted:     #66646c;
+    --accent-blue:    #3987e5;
+    --accent-blue-dim: rgba(57, 135, 229, 0.16);
+    --accent-orange:  #e8672f;
+    --accent-orange-dim: rgba(232, 103, 47, 0.24);
+    --curve:          #f0dcae;
+    --marker-line:    #46464e;
+    --empty-fill:     #201f24;
+    --empty-hatch:    #2c2b31;
+    color-scheme: dark;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    background: var(--bg-page);
+    color: var(--text-primary);
+    font-family: -apple-system, "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+    margin: 0;
+    padding: 40px 20px;
+    display: flex;
+    justify-content: center;
+  }
+
+  .mono {
+    font-family: ui-monospace, "SF Mono", "Cascadia Code", "Roboto Mono", monospace;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .panel {
+    width: 100%;
+    max-width: 1320px;
+    background: var(--bg-panel);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    overflow: hidden;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.45);
+  }
+
+  /* ── Header / transport strip ─────────────────────────────────── */
+
+  .transport {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 24px;
+    padding: 18px 24px;
+    background: var(--bg-header);
+    border-bottom: 1px solid var(--line);
+    flex-wrap: wrap;
+  }
+
+  .transport-title {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    min-width: 220px;
+  }
+
+  .transport-title .eyebrow {
+    font-size: 11px;
+    letter-spacing: 0.09em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+  }
+
+  .transport-title h1 {
+    margin: 0;
+    font-size: 19px;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+    text-wrap: balance;
+  }
+
+  .transport-stats {
+    display: flex;
+    gap: 28px;
+    flex-wrap: wrap;
+  }
+
+  .stat {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 56px;
+  }
+
+  .stat .label {
+    font-size: 10.5px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+  }
+
+  .stat .value {
+    font-size: 16px;
+    font-weight: 600;
+    color: var(--text-primary);
+  }
+
+  /* ── Grid area ─────────────────────────────────────────────────── */
+
+  .grid-scroll {
+    overflow-x: auto;
+  }
+
+  .grid {
+    display: grid;
+    grid-template-columns: 180px 1080px;
+    min-width: 1260px;
+  }
+
+  /* Track label column */
+
+  .track-label {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 0 16px;
+    border-right: 1px solid var(--line);
+    border-bottom: 1px solid var(--line);
+    background: var(--bg-header);
+  }
+
+  .track-label .chip {
+    width: 9px;
+    height: 9px;
+    border-radius: 2px;
+    flex: none;
+  }
+
+  .track-label .name-group {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    min-width: 0;
+  }
+
+  .track-label .name {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text-primary);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .track-label .kind {
+    font-size: 10.5px;
+    color: var(--text-muted);
+    letter-spacing: 0.04em;
+  }
+
+  .track-label.empty .name { color: var(--text-secondary); }
+
+  /* Ruler + marker corner */
+  .corner {
+    border-right: 1px solid var(--line);
+    border-bottom: 1px solid var(--line-strong);
+    background: var(--bg-header);
+  }
+
+  /* Ruler row */
+
+  .ruler {
+    position: relative;
+    border-bottom: 1px solid var(--line-strong);
+    background: var(--bg-header);
+    height: 40px;
+  }
+
+  .ruler .tick {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    display: flex;
+    align-items: flex-end;
+    padding-bottom: 4px;
+  }
+
+  .ruler .tick::before {
+    content: "";
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 1px;
+    height: 8px;
+    background: var(--line-strong);
+  }
+
+  .ruler .tick span {
+    margin-left: 5px;
+    font-size: 10.5px;
+    color: var(--text-muted);
+  }
+
+  .ruler .marker {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    border-left: 1px dashed var(--marker-line);
+  }
+
+  .ruler .marker span {
+    position: absolute;
+    top: 5px;
+    left: 6px;
+    font-size: 10.5px;
+    font-weight: 600;
+    color: var(--text-secondary);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    white-space: nowrap;
+  }
+
+  /* Track timeline row */
+
+  .lane {
+    position: relative;
+    border-bottom: 1px solid var(--line);
+  }
+
+  .lane .marker-line {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    border-left: 1px dashed var(--line);
+  }
+
+  .clip {
+    position: absolute;
+    top: 6px;
+    bottom: 6px;
+    border-radius: 4px;
+    overflow: hidden;
+  }
+
+  .clip.blue {
+    background: var(--accent-blue-dim);
+    border: 1px solid var(--accent-blue);
+  }
+
+  .clip.orange {
+    background: var(--accent-orange-dim);
+    border: 1px solid var(--accent-orange);
+  }
+
+  .clip .repeat-ticks {
+    position: absolute;
+    inset: 0;
+    background-image: repeating-linear-gradient(
+      90deg,
+      transparent 0, transparent 59px,
+      rgba(255,255,255,0.07) 59px, rgba(255,255,255,0.07) 60px
+    );
+  }
+
+  .clip .clip-label {
+    position: absolute;
+    top: 4px;
+    left: 7px;
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    color: var(--text-secondary);
+  }
+
+  .empty-fill {
+    position: absolute;
+    top: 6px;
+    bottom: 6px;
+    left: 0;
+    right: 0;
+    border-radius: 4px;
+    background: var(--empty-fill);
+    background-image: repeating-linear-gradient(
+      45deg,
+      transparent 0, transparent 7px,
+      var(--empty-hatch) 7px, var(--empty-hatch) 8px
+    );
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .empty-fill span {
+    font-size: 10.5px;
+    color: var(--text-muted);
+    letter-spacing: 0.02em;
+  }
+
+  .curve-svg {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    overflow: visible;
+  }
+
+  .curve-line {
+    fill: none;
+    stroke: var(--curve);
+    stroke-width: 1.75;
+    stroke-linejoin: round;
+    stroke-linecap: round;
+  }
+
+  .curve-line.dashed {
+    stroke-dasharray: 3 3;
+    stroke-width: 1.5;
+    opacity: 0.85;
+  }
+
+  .curve-dot {
+    fill: var(--curve);
+  }
+
+  .curve-caption {
+    grid-column: 2;
+    display: flex;
+    gap: 22px;
+    padding: 8px 14px;
+    background: var(--bg-row-alt);
+    border-bottom: 1px solid var(--line);
+    font-size: 11px;
+    color: var(--text-secondary);
+  }
+
+  .curve-caption .key {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+  }
+
+  .curve-caption .swatch {
+    width: 16px;
+    height: 0;
+    border-top: 1.75px solid var(--curve);
+  }
+
+  .curve-caption .swatch.dashed {
+    border-top-style: dashed;
+  }
+
+  /* ── Footer ────────────────────────────────────────────────────── */
+
+  .footer {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 16px;
+    padding: 14px 24px;
+    background: var(--bg-header);
+    border-top: 1px solid var(--line);
+    flex-wrap: wrap;
+  }
+
+  .footer p {
+    margin: 0;
+    font-size: 11.5px;
+    color: var(--text-muted);
+    line-height: 1.5;
+    max-width: 640px;
+  }
+
+  .footer .cmd {
+    font-size: 11px;
+    color: var(--text-secondary);
+    background: var(--bg-panel);
+    border: 1px solid var(--line);
+    border-radius: 5px;
+    padding: 5px 9px;
+    white-space: nowrap;
+  }
+
+  @media (prefers-reduced-motion: no-preference) {
+    .panel { animation: none; }
+  }
+</style>
+</head>
+<body>
+<div class="panel">
+
+  <div class="transport">
+    <div class="transport-title">
+      <span class="eyebrow">ableton-arrange · output.als</span>
+      <h1>Dub build, 72 bars</h1>
+    </div>
+    <div class="transport-stats mono">
+      <div class="stat"><span class="label">BPM</span><span class="value">128.0</span></div>
+      <div class="stat"><span class="label">Time</span><span class="value">4/4</span></div>
+      <div class="stat"><span class="label">Bars</span><span class="value">72</span></div>
+      <div class="stat"><span class="label">Tracks</span><span class="value">6</span></div>
+      <div class="stat"><span class="label">Clips</span><span class="value">3</span></div>
+    </div>
+  </div>
+
+  <div class="grid-scroll">
+    <div class="grid">
+
+      <!-- Ruler row -->
+      <div class="corner"></div>
+      <div class="ruler mono" style="position:relative;">
+        <!-- bar ticks every 8 bars -->
+        <div class="tick" style="left:0px"><span>1</span></div>
+        <div class="tick" style="left:120px"><span>9</span></div>
+        <div class="tick" style="left:240px"><span>17</span></div>
+        <div class="tick" style="left:360px"><span>25</span></div>
+        <div class="tick" style="left:480px"><span>33</span></div>
+        <div class="tick" style="left:600px"><span>41</span></div>
+        <div class="tick" style="left:720px"><span>49</span></div>
+        <div class="tick" style="left:840px"><span>57</span></div>
+        <div class="tick" style="left:960px"><span>65</span></div>
+        <div class="tick" style="left:1065px"><span>73</span></div>
+        <!-- section markers -->
+        <div class="marker" style="left:0px"><span>Intro</span></div>
+        <div class="marker" style="left:120px"><span>Build</span></div>
+        <div class="marker" style="left:240px"><span>Drop</span></div>
+        <div class="marker" style="left:480px"><span>Breakdown</span></div>
+        <div class="marker" style="left:600px"><span>Build</span></div>
+        <div class="marker" style="left:720px"><span>Drop</span></div>
+        <div class="marker" style="left:960px"><span>Outro</span></div>
+      </div>
+
+      <!-- 1-Analog row -->
+      <div class="track-label">
+        <div class="chip" style="background:var(--accent-blue)"></div>
+        <div class="name-group">
+          <span class="name">1-Analog</span>
+          <span class="kind">MIDI · full length</span>
+        </div>
+      </div>
+      <div class="lane" style="height:84px;">
+        <div class="marker-line" style="left:120px"></div>
+        <div class="marker-line" style="left:240px"></div>
+        <div class="marker-line" style="left:480px"></div>
+        <div class="marker-line" style="left:600px"></div>
+        <div class="marker-line" style="left:720px"></div>
+        <div class="marker-line" style="left:960px"></div>
+        <div class="clip blue" style="left:0px; width:1080px;">
+          <div class="repeat-ticks"></div>
+          <div class="clip-label">1-Analog — bars 1–73</div>
+          <svg class="curve-svg" viewBox="0 0 1080 84" preserveAspectRatio="none">
+            <polyline class="curve-line" points="0,67.6 120,54.8 240,13.2 480,48.4 600,42.0 720,10.0 960,61.2 1080,61.2" />
+            <polyline class="curve-line dashed" points="480,70.8 510,16.4 540,70.8 570,16.4 600,70.8" />
+          </svg>
+        </div>
+      </div>
+
+      <!-- curve caption -->
+      <div class="corner" style="border-bottom:1px solid var(--line);"></div>
+      <div class="curve-caption">
+        <div class="key"><span class="swatch"></span>Filter cutoff (pointee 22277)</div>
+        <div class="key"><span class="swatch dashed"></span>Send 0 throw, bars 33–41</div>
+      </div>
+
+      <!-- 2-DS Kick row -->
+      <div class="track-label">
+        <div class="chip" style="background:var(--accent-orange)"></div>
+        <div class="name-group">
+          <span class="name">2-DS Kick</span>
+          <span class="kind">MIDI · segmented</span>
+        </div>
+      </div>
+      <div class="lane" style="height:64px;">
+        <div class="marker-line" style="left:120px"></div>
+        <div class="marker-line" style="left:240px"></div>
+        <div class="marker-line" style="left:480px"></div>
+        <div class="marker-line" style="left:600px"></div>
+        <div class="marker-line" style="left:720px"></div>
+        <div class="marker-line" style="left:960px"></div>
+        <div class="clip orange" style="left:0px; width:480px;">
+          <div class="repeat-ticks"></div>
+          <div class="clip-label">bars 1–33</div>
+        </div>
+        <div class="clip orange" style="left:600px; width:480px;">
+          <div class="repeat-ticks"></div>
+          <div class="clip-label">bars 41–73</div>
+        </div>
+      </div>
+
+      <!-- empty tracks -->
+      <div class="track-label empty">
+        <div class="chip" style="background:var(--empty-hatch)"></div>
+        <div class="name-group">
+          <span class="name">3-Audio</span>
+          <span class="kind">Audio · no clip</span>
+        </div>
+      </div>
+      <div class="lane" style="height:40px;">
+        <div class="marker-line" style="left:120px"></div>
+        <div class="marker-line" style="left:240px"></div>
+        <div class="marker-line" style="left:480px"></div>
+        <div class="marker-line" style="left:600px"></div>
+        <div class="marker-line" style="left:720px"></div>
+        <div class="marker-line" style="left:960px"></div>
+        <div class="empty-fill"><span>skipped — no source clip</span></div>
+      </div>
+
+      <div class="track-label empty">
+        <div class="chip" style="background:var(--empty-hatch)"></div>
+        <div class="name-group">
+          <span class="name">4-Audio</span>
+          <span class="kind">Audio · no clip</span>
+        </div>
+      </div>
+      <div class="lane" style="height:40px;">
+        <div class="marker-line" style="left:120px"></div>
+        <div class="marker-line" style="left:240px"></div>
+        <div class="marker-line" style="left:480px"></div>
+        <div class="marker-line" style="left:600px"></div>
+        <div class="marker-line" style="left:720px"></div>
+        <div class="marker-line" style="left:960px"></div>
+        <div class="empty-fill"><span>skipped — no source clip</span></div>
+      </div>
+
+      <div class="track-label empty">
+        <div class="chip" style="background:var(--empty-hatch)"></div>
+        <div class="name-group">
+          <span class="name">A-Reverb</span>
+          <span class="kind">Return · no clip</span>
+        </div>
+      </div>
+      <div class="lane" style="height:40px; border-bottom: 1px solid var(--line);">
+        <div class="marker-line" style="left:120px"></div>
+        <div class="marker-line" style="left:240px"></div>
+        <div class="marker-line" style="left:480px"></div>
+        <div class="marker-line" style="left:600px"></div>
+        <div class="marker-line" style="left:720px"></div>
+        <div class="marker-line" style="left:960px"></div>
+        <div class="empty-fill"><span>skipped — no source clip</span></div>
+      </div>
+
+      <div class="track-label empty" style="border-bottom:none;">
+        <div class="chip" style="background:var(--empty-hatch)"></div>
+        <div class="name-group">
+          <span class="name">B-Delay</span>
+          <span class="kind">Return · no clip</span>
+        </div>
+      </div>
+      <div class="lane" style="height:40px; border-bottom:none;">
+        <div class="marker-line" style="left:120px"></div>
+        <div class="marker-line" style="left:240px"></div>
+        <div class="marker-line" style="left:480px"></div>
+        <div class="marker-line" style="left:600px"></div>
+        <div class="marker-line" style="left:720px"></div>
+        <div class="marker-line" style="left:960px"></div>
+        <div class="empty-fill"><span>skipped — no source clip</span></div>
+      </div>
+
+    </div>
+  </div>
+
+  <div class="footer">
+    <p>
+      Generated from a real run of <span class="mono">arrangement_tool.py</span> against
+      this repo's <span class="mono">base.als</span> — every clip, gap, and curve above was
+      read back out of the produced <span class="mono">output.als</span>, not hand-drawn.
+      This is a diagram, not an actual Ableton Live screenshot.
+    </p>
+    <span class="cmd mono">python3 arrangement_tool.py structure.json base.als output.als</span>
+  </div>
+
+</div>
+</body>
+</html>
