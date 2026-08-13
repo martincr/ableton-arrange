@@ -46,7 +46,16 @@ JSON format:
         {"bar": 51, "value": 0.05}
       ]
     }
-  ]
+  ],
+  "track_notes": {
+    "2-DS Kick": {
+      "loop_bars": 1,
+      "notes": [
+        {"pitch": "C1", "start": 0, "duration": 0.5, "velocity": 110},
+        {"pitch": "C1", "start": 2, "duration": 0.5}
+      ]
+    }
+  }
 }
 
 parameter_pointee: the ModulationTarget/Pointee Id of the parameter.
@@ -61,6 +70,14 @@ track_segments: optional. Tracks not listed get one clip spanning the whole
 send_throws: optional. Applies the same automation points to the Nth Send
   (0-indexed) on every track that has one, without listing a parameter_pointee
   per track — e.g. a reverb "dub throw" spike across the whole song at once.
+track_notes: optional. Replaces the note content of a track's source clip
+  before it is placed, so you can write patterns from JSON instead of playing
+  them in. pitch is a MIDI number (0-127) or a name (C3 = 60, e.g. "F#2",
+  "Bb4"); start/duration are in beats from the clip start; velocity defaults
+  to 100 and off_velocity to 64. loop_bars resizes the loop region so the new
+  pattern repeats at that length — set it whenever the pattern you write is a
+  different length from the source clip, or the placed clips will loop at the
+  old length.
 """
 
 import gzip, re, json, sys, copy, argparse, os, shutil
@@ -137,6 +154,97 @@ def get_send_pointee(track_el, send_index):
         return None
     at = holders[send_index].find('Send/AutomationTarget')
     return int(at.get('Id')) if at is not None else None
+
+
+# ── Note writer ───────────────────────────────────────────────────────────────
+
+_SEMITONES = {'C': 0, 'D': 2, 'E': 4, 'F': 5, 'G': 7, 'A': 9, 'B': 11}
+
+def parse_pitch(pitch):
+    """
+    Accept a MIDI note number (0-127) or a note name and return the number.
+
+    Names follow Ableton's convention where C3 = 60: 'C3', 'F#2', 'Bb4', 'Eb-1'.
+    """
+    if isinstance(pitch, int):
+        value = pitch
+    else:
+        m = re.fullmatch(r'\s*([A-Ga-g])([#b]?)(-?\d+)\s*', str(pitch))
+        if not m:
+            raise ValueError(f"Unrecognised pitch {pitch!r} — use 0-127 or a name like 'C3'")
+        letter, accidental, octave = m.group(1).upper(), m.group(2), int(m.group(3))
+        value = (octave + 2) * 12 + _SEMITONES[letter]
+        if accidental == '#':
+            value += 1
+        elif accidental == 'b':
+            value -= 1
+    if not 0 <= value <= 127:
+        raise ValueError(f"Pitch {pitch!r} resolves to {value}, outside the MIDI range 0-127")
+    return value
+
+def set_clip_notes(clip_el, notes, start_id, beats_per_bar, loop_bars=None):
+    """
+    Replace a MidiClip's note content.
+
+    notes: list of {"pitch", "start", "duration", "velocity", "off_velocity"} —
+           `start`/`duration` in beats relative to the clip start.
+    loop_bars: if given, resize the clip's loop region so the new pattern repeats
+           at that length instead of the source clip's original length.
+
+    Returns the next free id (KeyTrack ids are drawn from the same counter as
+    clip ids, so callers keep NextPointeeId in sync).
+    """
+    notes_el = clip_el.find('Notes')
+    if notes_el is None:
+        raise ValueError("Clip has no <Notes> element to write into")
+    keytracks_el = notes_el.find('KeyTracks')
+    if keytracks_el is None:
+        keytracks_el = ET.SubElement(notes_el, 'KeyTracks')
+
+    # Group by pitch — Ableton stores one KeyTrack per distinct note.
+    by_pitch = {}
+    for n in notes:
+        by_pitch.setdefault(parse_pitch(n['pitch']), []).append(n)
+
+    for child in list(keytracks_el):
+        keytracks_el.remove(child)
+
+    note_id = 1
+    for pitch in sorted(by_pitch):
+        kt = ET.SubElement(keytracks_el, 'KeyTrack', Id=str(start_id))
+        start_id += 1
+        kt_notes = ET.SubElement(kt, 'Notes')
+        for n in sorted(by_pitch[pitch], key=lambda x: float(x['start'])):
+            velocity = n.get('velocity', 100)
+            ET.SubElement(kt_notes, 'MidiNoteEvent',
+                          Time=str(float(n['start'])),
+                          Duration=str(float(n.get('duration', 1.0))),
+                          Velocity=str(velocity),
+                          OffVelocity=str(n.get('off_velocity', 64)),
+                          NoteId=str(note_id))
+            note_id += 1
+        # MidiKey follows Notes — Ableton relies on this child order.
+        ET.SubElement(kt, 'MidiKey', Value=str(pitch))
+
+    gen = notes_el.find('NoteIdGenerator/NextId')
+    if gen is not None:
+        gen.set('Value', str(note_id))
+
+    if loop_bars is not None:
+        length = loop_bars * beats_per_bar
+        loop = clip_el.find('Loop')
+        for tag in ('LoopStart', 'HiddenLoopStart'):
+            el = loop.find(tag)
+            if el is not None:
+                el.set('Value', '0')
+        for tag in ('LoopEnd', 'HiddenLoopEnd', 'OutMarker'):
+            el = loop.find(tag)
+            if el is not None:
+                el.set('Value', str(length))
+        clip_el.find('CurrentStart').set('Value', '0')
+        clip_el.find('CurrentEnd').set('Value', str(length))
+
+    return start_id
 
 
 # ── Inspection ───────────────────────────────────────────────────────────────
@@ -368,6 +476,7 @@ def build_arrangement(cfg, base_als_path, output_als_path, backup=False):
     auto_specs     = cfg.get('automations', [])
     track_segments = cfg.get('track_segments', {})
     send_throws    = cfg.get('send_throws', [])
+    track_notes    = cfg.get('track_notes', {})
 
     with gzip.open(base_als_path, 'rb') as f:
         als_xml = f.read().decode('utf-8')
@@ -405,6 +514,7 @@ def build_arrangement(cfg, base_als_path, output_als_path, backup=False):
         auto_by_track.setdefault(tname, {})[pointee] = pts
 
     clip_id = get_next_id(als_xml)
+    notes_written = set()
 
     # Place clips on every MIDI track
     for t in tracks:
@@ -418,6 +528,22 @@ def build_arrangement(cfg, base_als_path, output_als_path, backup=False):
         source_clip = find_any_clip(t)
         if source_clip is None:
             continue
+
+        # Note-writing: rewrite the source clip's contents before it gets cloned
+        # into the arrangement, so every placed copy carries the new pattern.
+        # The source clip is edited in place, so the session view shows it too.
+        note_spec = track_notes.get(tname)
+        if note_spec is not None:
+            if 'notes' not in note_spec:
+                raise ValueError(f"track_notes['{tname}'] has no 'notes' list")
+            notes_written.add(tname)
+            clip_id = set_clip_notes(
+                source_clip,
+                note_spec['notes'],
+                start_id=clip_id,
+                beats_per_bar=beats_per_bar,
+                loop_bars=note_spec.get('loop_bars'),
+            )
 
         # Clear existing arrangement clips
         for child in list(events_el):
@@ -514,6 +640,11 @@ def build_arrangement(cfg, base_als_path, output_als_path, backup=False):
         print(f"Segmented tracks: {list(track_segments.keys())}")
     if send_throws:
         print(f"Send-throw automation on send index(es): {[s['send_index'] for s in send_throws]}")
+    if track_notes:
+        print(f"Notes written for: {sorted(notes_written)}")
+        unmatched = sorted(set(track_notes) - notes_written)
+        if unmatched:
+            print(f"  WARNING: no matching track with a clip for: {unmatched}")
     print(f"\nOutput: {output_als_path}")
 
 

@@ -62,7 +62,17 @@ python3 arrangement_tool.py --inspect base.als [track]
         {"bar": 19, "value": 0.05}
       ]
     }
-  ]
+  ],
+  "track_notes": {
+    "2-DS Kick": {
+      "loop_bars": 1,
+      "notes": [
+        {"pitch": "C1", "start": 0,   "duration": 0.5, "velocity": 110},
+        {"pitch": "C1", "start": 2,   "duration": 0.5},
+        {"pitch": 42,   "start": 0.5, "duration": 0.25}
+      ]
+    }
+  }
 }
 ```
 
@@ -82,21 +92,31 @@ python3 arrangement_tool.py --inspect base.als [track]
 | `track_segments` | Optional: `{"track name": [[start_bar, end_bar), ...]}`. Gives that track one looping clip per bar range instead of one clip spanning the whole song, so it can drop in and out (e.g. drums silent during a breakdown). Tracks not listed get the default full-length clip |
 | `send_throws[].send_index` | 0-indexed Send slot. Applies the same `points` to that Send on every track that has one — a shortcut for something like a reverb "dub throw" spike across the whole arrangement without listing a `parameter_pointee` per track |
 | `send_throws[].points` | Same `{bar, value}` shape as `automations[].points` |
+| `track_notes` | Optional: `{"track name": {"loop_bars": N, "notes": [...]}}`. Replaces the note content of that track's source clip, so you can write patterns in JSON rather than playing them in |
+| `track_notes[].loop_bars` | Optional. Resizes the loop region so the written pattern repeats at this length. Set it whenever your pattern is a different length from the source clip |
+| `track_notes[].notes[].pitch` | MIDI number `0–127`, or a note name where C3 = 60 — `"C3"`, `"F#2"`, `"Bb4"` |
+| `track_notes[].notes[].start` | Position in **beats** from the clip start |
+| `track_notes[].notes[].duration` | Length in beats (default `1.0`) |
+| `track_notes[].notes[].velocity` | `0–127` (default `100`) |
+| `track_notes[].notes[].off_velocity` | `0–127` (default `64`) |
 
 ## How it works
 
 1. Decompresses the base `.als` (gzip XML)
 2. For each MIDI track, uses that track's own session/arrangement clip as the loop template
-3. Places a single clip per track spanning the full arrangement length by default — or, for tracks listed in `track_segments`, one clip per bar range — with the original loop region preserved so the source pattern repeats throughout
-4. Writes clip-level automation envelopes for any tracks listed in `automations`, plus any `send_throws`
-5. Adds named arrangement markers at each section boundary
-6. Sets BPM
-7. Optionally backs up an existing output file (`--backup`) before overwriting
-8. Writes the output `.als`
+3. Rewrites that clip's notes for any track listed in `track_notes`
+4. Places a single clip per track spanning the full arrangement length by default — or, for tracks listed in `track_segments`, one clip per bar range — with the loop region preserved so the pattern repeats throughout
+5. Writes clip-level automation envelopes for any tracks listed in `automations`, plus any `send_throws`
+6. Adds named arrangement markers at each section boundary
+7. Sets BPM
+8. Optionally backs up an existing output file (`--backup`) before overwriting
+9. Writes the output `.als`
 
 ## Base project requirements
 
 Each MIDI track that should appear in the arrangement needs at least one MIDI clip — either in a session slot or already in the arrangement. The script will skip any track with no clip. Track names used in `automations` must exactly match the track's `EffectiveName` in Ableton.
+
+This applies to `track_notes` too: it rewrites the notes *inside* an existing clip, so the track still needs a clip to write into. An empty clip is enough — the notes in it are replaced wholesale — but a track with no clip at all is skipped, and the script prints a warning naming any `track_notes` entry that never matched.
 
 ## Finding parameter_pointee IDs
 
