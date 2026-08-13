@@ -50,7 +50,16 @@ python3 arrangement_tool.py --inspect base.als [track]
         {"bar": 19, "value": 0.05}
       ]
     }
-  ]
+  ],
+  "track_notes": {
+    "2-DS Kick": {
+      "loop_bars": 1,
+      "notes": [
+        {"pitch": "C1", "start": 0, "duration": 0.5, "velocity": 110},
+        {"pitch": "C1", "start": 2, "duration": 0.5}
+      ]
+    }
+  }
 }
 ```
 
@@ -70,17 +79,25 @@ python3 arrangement_tool.py --inspect base.als [track]
 | `track_segments` | Optional. Maps a track name to a list of `[start_bar, end_bar)` ranges (end exclusive) — that track gets one looping clip per range instead of one clip spanning the whole song, so it can drop in/out. Tracks not listed keep the default full-length behavior |
 | `send_throws[].send_index` | 0-indexed Send slot; applies the same automation `points` to that Send on every track that has one, without listing a `parameter_pointee` per track |
 | `send_throws[].points` | Same `{bar, value}` shape as `automations[].points` |
+| `track_notes` | Optional. Maps a track name to `{loop_bars, notes}` — replaces the note content of that track's source clip before it is placed, so patterns can be written from JSON instead of played in |
+| `track_notes[].loop_bars` | Optional. Resizes the clip's loop region so the written pattern repeats at this length. Set it whenever the pattern differs in length from the source clip, or placed clips keep looping at the old length |
+| `track_notes[].notes[].pitch` | MIDI number `0–127`, or a name where C3 = 60 (`"C3"`, `"F#2"`, `"Bb4"`) |
+| `track_notes[].notes[].start` | Beats from the clip start (not bars) |
+| `track_notes[].notes[].duration` | Beats (default: `1.0`) |
+| `track_notes[].notes[].velocity` | `0–127` (default: `100`) |
+| `track_notes[].notes[].off_velocity` | `0–127` (default: `64`) |
 
 ## How it works
 
 1. Reads and decompresses the base `.als` (gzip XML)
 2. For each MIDI track, uses that track's own clip as the source template
-3. Places one looping clip per track spanning the full arrangement length by default, or one clip per `track_segments` range for tracks that have segments
-4. Injects clip-level automation envelopes for tracks listed in `automations`, plus any `send_throws` (filtered and re-anchored to clip-relative time for segmented tracks)
-5. Writes named markers at each section boundary
-6. Sets BPM (handles Live 12 `MainTrack`, Live 10/11 `MasterTrack`, and pre-v10 legacy paths)
-7. Optionally backs up an existing `output.als` to `output.als.backup` (`--backup`)
-8. Writes the output `.als`
+3. Rewrites that source clip's notes for any track listed in `track_notes` (in place, so the session clip shows the new pattern too)
+4. Places one looping clip per track spanning the full arrangement length by default, or one clip per `track_segments` range for tracks that have segments
+5. Injects clip-level automation envelopes for tracks listed in `automations`, plus any `send_throws` (filtered and re-anchored to clip-relative time for segmented tracks)
+6. Writes named markers at each section boundary
+7. Sets BPM (handles Live 12 `MainTrack`, Live 10/11 `MasterTrack`, and pre-v10 legacy paths)
+8. Optionally backs up an existing `output.als` to `output.als.backup` (`--backup`)
+9. Writes the output `.als`
 
 ## base.als requirements
 
@@ -122,3 +139,7 @@ Look for `<AutomationTarget Id="...">` or `<ModulationTarget Id="...">` adjacent
 - `track_height` sets `LaneHeight` directly on track elements — effective on Live ≤11; no-ops silently on Live 12 where height is stored elsewhere
 - `automations[].points` and `send_throws[].points` use global song bar numbers. For a track with `track_segments`, points outside a given segment's bar range don't apply to that segment's clip — there's no interpolation across the gap, so add explicit points near each segment boundary if you need a specific value there
 - `--backup` only triggers when the output path already exists — the first run to a new path never creates a `.backup` file
+- `track_notes` edits the track's source clip in place, so the rewritten pattern appears in the session view as well as in every placed arrangement clip. A track with more than one session clip only has its *first* clip (the one `find_any_clip` returns) rewritten
+- `track_notes[].notes[].start` is in **beats**, unlike `automations[].points[].bar` which is in bars — a 4/4 bar is 4 beats
+- Writing notes without setting `loop_bars` keeps the source clip's original loop length, so a 1-bar pattern written into a 4-bar clip still repeats every 4 bars with 3 bars of silence
+- An empty `notes` list is valid and clears the clip
