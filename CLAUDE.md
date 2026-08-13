@@ -17,6 +17,8 @@ python3 arrangement_tool.py --inspect base.als [track]
 - `--xml ALS` — decompress a `.als` to readable XML for inspection (e.g. finding `parameter_pointee` IDs)
 - `--inspect ALS [track]` — print a structured summary: BPM, tracks, session clips and bar lengths, and arrangement status; pass a track name to instead list its automatable parameters (device, parameter, target id, current value, range) and Send target ids
 
+There's also `analyze_audio.py`, a separate script (own dependencies: numpy/scipy/scikit-learn/librosa/soundfile — see its docstring) that analyzes a WAV/MP3 and proposes a bar-aligned `structure.json` skeleton with placeholder section names for a human to rename. It doesn't affect `arrangement_tool.py`, which stays stdlib-only.
+
 ## structure.json format
 
 ```json
