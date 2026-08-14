@@ -7,6 +7,8 @@ A command-line tool that builds an Ableton Live arrangement from a JSON song str
 - Python 3 (stdlib only — no dependencies)
 - Ableton Live 12
 
+(The optional audio analyzer described below is a separate script with its own, heavier dependencies — it doesn't affect this list.)
+
 ## Usage
 
 ```
@@ -163,3 +165,20 @@ Opening `output.als` in Ableton will show:
 - BPM set as specified
 
 If clips are not visible, press **Tab** to switch to Arrangement View.
+
+## Audio analysis (experimental)
+
+Don't want to hand-author `structure.json` by ear? `analyze_audio.py` is a separate script that analyzes a WAV/MP3 reference track and proposes one — bar-aligned section boundaries, plus a "repetition group" per section so you can spot repeats (e.g. two drops) at a glance.
+
+```bash
+pip install numpy scipy scikit-learn "librosa<1.0.0" soundfile
+python3 analyze_audio.py song.wav
+python3 analyze_audio.py song.mp3 --sections 6 --time-signature 4 --write structure.json
+```
+
+It never guesses section *names* — a segmentation algorithm can tell you "these two sections look alike," not "this one is the drop." Without `--write` it only prints a report; with `--write` it emits a `structure.json` skeleton with placeholder names (`section_1`, `section_2`, ...) that you rename by ear before running `arrangement_tool.py`.
+
+Known limitations — see the script's own docstring for the full list:
+- No downbeat detection; bar 1 is assumed to be the first detected beat
+- `--sections` needs hand-tuning (start around 6–8)
+- BPM detection can octave-error on electronic music; use `--bpm-hint` if the reported tempo is clearly half or double the real one
