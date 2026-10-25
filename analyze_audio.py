@@ -7,8 +7,8 @@ Usage:
     python3 analyze_audio.py song.wav
     python3 analyze_audio.py song.mp3 --sections 6 --time-signature 4 --write structure.json
 
-Prints a table of candidate sections: bar range, length, mean energy, energy
-trend, and a repetition "group" letter (sections sharing a letter look
+Prints a table of candidate sections: bar range, length, energy relative to
+the track's own range, energy trend, and a repetition "group" letter (sections sharing a letter look
 structurally similar — e.g. two drops). Nothing is written to disk unless
 --write is given, and even then the section names are neutral placeholders
 ("section_1", "section_2", ...) — this tool proposes bar-aligned boundaries
@@ -458,35 +458,53 @@ def boundary_stability(C, mfcc, bars, sr, n_sections, segments):
 
 # ── Per-section report stats ─────────────────────────────────────────────────
 
+TREND_THRESHOLD = 0.10   # a fitted rise/fall of 10% of the track's own level range
+MIN_LEVEL_SPAN_DB = 1.0  # tracks flatter than this aren't stretched to fill 0-1
+
+
 def annotate_energy(segments, y, sr, bars, beats_per_bar):
+    """
+    Add 'energy' (0-1) and 'trend' to each segment.
+
+    Energy is relative to the track itself: each bar's mean RMS level in dB,
+    scaled so the track's 5th-95th percentile of bar levels spans 0-1.
+    Scaling by the loudest moment instead squeezed a heavily compressed track
+    — "Transport" spans just 3.4 dB from intro to groove — into 0.34-0.48,
+    with a fade-out wasting the rest of the scale; percentiles stop a fade or
+    a silent bar from setting the range. The displayed energy is clipped to
+    0-1, but the trend is fitted on unclipped levels, so a fade that drops far
+    below the range still reads as falling.
+    """
     rms = librosa.feature.rms(y=y)[0]
     rms_times = librosa.frames_to_time(np.arange(len(rms)), sr=sr, hop_length=512)
-    rms_norm = rms / (rms.max() + 1e-12)
 
     end_time = len(y) / sr
     bar_edges = [b['time'] for b in bars] + [end_time]
-    bar_energy = []
+    bar_rms = []
     for t0, t1 in zip(bar_edges[:-1], bar_edges[1:]):
-        vals = rms_norm[(rms_times >= t0) & (rms_times < t1)]
-        bar_energy.append(float(vals.mean()) if len(vals) else 0.0)
-    bar_energy = np.array(bar_energy)
+        vals = rms[(rms_times >= t0) & (rms_times < t1)]
+        bar_rms.append(float(vals.mean()) if len(vals) else 0.0)
+    bar_db = 20 * np.log10(np.maximum(bar_rms, 1e-10))
+    lo, hi = np.percentile(bar_db, [5, 95])
+    bar_level = (bar_db - lo) / max(hi - lo, MIN_LEVEL_SPAN_DB)
 
     for seg in segments:
-        per_bar = bar_energy[seg['bar_start'] - 1:seg['bar_end'] - 1]
+        per_bar = bar_level[seg['bar_start'] - 1:seg['bar_end'] - 1]
         if len(per_bar) == 0:
             seg['energy'] = 0.0
             seg['trend'] = 'flat'
             continue
-        seg['energy'] = round(float(per_bar.mean()), 2)
-        # Fit the trend over per-bar means, then threshold the fitted change
-        # from first bar to last. Per-bar means ignore envelope shape *within*
+        seg['energy'] = round(float(np.clip(per_bar, 0, 1).mean()), 2)
+        # Fit the trend over per-bar levels, then threshold the fitted change
+        # from first bar to last. Per-bar levels ignore envelope shape *within*
         # a bar (a stab decaying every bar is steady, not falling), and a
         # whole-segment change is scale-free — a per-frame slope on ~23 ms RMS
         # frames is too small to ever cross a fixed threshold.
         change = 0.0
         if len(per_bar) >= 2:
             change = np.polyfit(np.arange(len(per_bar)), per_bar, 1)[0] * (len(per_bar) - 1)
-        seg['trend'] = 'rising' if change > 0.05 else 'falling' if change < -0.05 else 'flat'
+        seg['trend'] = ('rising' if change > TREND_THRESHOLD
+                        else 'falling' if change < -TREND_THRESHOLD else 'flat')
     return segments
 
 
@@ -549,9 +567,11 @@ def print_report(tempo, segments, beats_per_bar, notes=(), tempo_source=''):
     for i, seg in enumerate(segments, 1):
         length = seg['bar_end'] - seg['bar_start']
         bars_str = f"{seg['bar_start']}–{seg['bar_end']}"
-        print(f"{i:<4} {bars_str:<12} {length:<9} {seg['energy']:<8} {seg['trend']:<9} "
+        print(f"{i:<4} {bars_str:<12} {length:<9} {seg['energy']:<8.2f} {seg['trend']:<9} "
               f"{group_letter(seg['group']):<7} {boundary_label(seg)}")
     print()
+    print("Energy is relative to this track: 0 = its quietest bars, 1 = its loudest")
+    print("(5th-95th percentile of bar levels, in dB).")
     if any(seg.get('stable') for seg in segments):
         runs = next(seg['stable'][1] for seg in segments if seg.get('stable'))
         print(f"Boundary = whether the row's start held when the analysis was re-run {runs} times")

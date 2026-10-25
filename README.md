@@ -176,7 +176,7 @@ python3 analyze_audio.py song.wav
 python3 analyze_audio.py song.mp3 --sections 6 --time-signature 4 --write structure.json
 ```
 
-It never guesses section *names* — a segmentation algorithm can tell you "these two sections look alike," not "this one is the drop." Without `--write` it only prints a report; with `--write` it emits a `structure.json` skeleton with placeholder names (`section_1`, `section_2`, ...) that you rename by ear before running `arrangement_tool.py`.
+It never guesses section *names* — a segmentation algorithm can tell you "these two sections look alike," not "this one is the drop." Without `--write` it only prints a report; with `--write` it emits a `structure.json` skeleton with placeholder names (`section_1`, `section_2`, ...) that you rename by ear before running `arrangement_tool.py`. Each row also shows its energy relative to the track itself (0 = the track's quietest bars, 1 = its loudest, so a compressed master still spreads across the scale), an energy trend, and whether its start boundary is firm.
 
 The bar grid is a single steady-tempo grid fitted to the whole track, with the downbeat anchored on the groove entry (the first sustained rise in low-end energy and onsets) and bars counted back from there. The report tells you where it anchored and where the audio starts relative to bar 1 — e.g. "anchored on the groove entry at 2:03.9 = bar 64, beat 1 — the audio starts on bar 1" — so you can line the audio up in Ableton.
 
