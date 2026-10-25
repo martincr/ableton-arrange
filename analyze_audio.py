@@ -37,10 +37,13 @@ Limitations (read before trusting the output):
   track into slivers. Start around 4-8 and adjust.
 - The beat tracker can lock onto the wrong tempo — not only half/double, but
   e.g. 4/5 of the real tempo on delay-heavy dub techno, where an echo pattern
-  can out-score the kick. The report prints a WARNING when the tracked tempo
-  disagrees with an independent estimate, suggesting a value; --bpm-hint pins
-  the tempo, and is itself checked against the audio (a hint copied from a
-  BPM website can be off). Tempi are refined to ~0.01 BPM by fitting steady
+  can out-score the kick. When the tracked tempo disagrees with an
+  independent measurement, the measured tempo is used automatically if a
+  steady grid at it fits the onsets better (the report says so). Half/double
+  disagreements only print a WARNING: a half-tempo grid can fit better than
+  the true one, so the fit can't settle them. --bpm-hint pins the tempo, and
+  is itself checked against the audio (a hint copied from a BPM website can
+  be off). Tempi are refined to ~0.01 BPM by fitting steady
   grids to the onsets, so they aren't rounded to librosa's coarse lag steps.
   Check by ear either way — the warnings can't tell which value is right.
 - MP3 support depends on the installed soundfile/libsndfile build actually
@@ -100,21 +103,22 @@ def comb_fit(env, fps, bpms):
     frame lags — near 120 BPM the only values available are 117.5, 123.0 and
     129.2 — which is how a track at exactly 122.00 came out as "123".
     """
-    best_score, best_bpm, best_phase = -1.0, None, None
-    for bpm in bpms:
-        period = 60.0 / bpm * fps
-        n = int((len(env) - 1 - period) // period)
-        if n < 2:
-            continue
-        phases = np.arange(0, period, 0.5)
-        idx = np.round(phases[:, None] + period * np.arange(n)[None, :]).astype(int)
-        scores = env[idx].mean(axis=1)
-        if scores.max() > best_score:
-            best_score = scores.max()
-            best_bpm, best_phase = float(bpm), phases[scores.argmax()] / fps
-    if best_bpm is None:
+    (score, phase), bpm = max(((grid_fit(env, fps, b), b) for b in bpms), key=lambda f: f[0][0])
+    if score < 0:
         raise ValueError("Audio too short to fit a tempo")
-    return best_bpm, best_phase
+    return float(bpm), phase
+
+
+def grid_fit(env, fps, bpm):
+    """Best phase for a steady grid at `bpm`, as (score, phase_seconds); score is mean onset strength on the grid."""
+    period = 60.0 / bpm * fps
+    n = int((len(env) - 1 - period) // period)
+    if n < 2:
+        return -1.0, 0.0
+    phases = np.arange(0, period, 0.5)
+    idx = np.round(phases[:, None] + period * np.arange(n)[None, :]).astype(int)
+    scores = env[idx].mean(axis=1)
+    return float(scores.max()), phases[scores.argmax()] / fps
 
 
 def refine_tempo(env, fps, bpm, span=0.05):
@@ -139,6 +143,33 @@ def check_tempo(y, sr, env, fps, tracked):
     oenv = librosa.onset.onset_strength(y=y, sr=sr)
     pulse = refine_tempo(env, fps, float(librosa.feature.tempo(onset_envelope=oenv, sr=sr)[0]))
     return None if abs(tracked / pulse - 1) <= TEMPO_TOLERANCE else pulse
+
+
+def octave_relation(tracked, measured):
+    """'double' or 'half' if `measured` is ~2x or ~0.5x `tracked`, else ''."""
+    ratio = measured / tracked
+    if abs(ratio / 2 - 1) <= TEMPO_TOLERANCE:
+        return 'double'
+    if abs(ratio * 2 - 1) <= TEMPO_TOLERANCE:
+        return 'half'
+    return ''
+
+
+def resolve_tempo(env, fps, tracked, measured):
+    """
+    Choose between the tracker's tempo and the independent measurement when
+    they disagree. Returns (tempo, report line).
+
+    Switches to `measured` when its steady grid fits the onsets better than
+    `tracked`'s. Half/double disagreements only warn: a grid at half the true
+    tempo lands on just the strongest hits and can fit *better* (61 BPM
+    outscored the real 122 on "Transport"), so the fit can't settle them.
+    """
+    if octave_relation(tracked, measured) or grid_fit(env, fps, measured)[0] <= grid_fit(env, fps, tracked)[0]:
+        return tracked, tempo_warning(tracked, measured)
+    return measured, (f"NOTE: the beat tracker locked onto {tracked:.2f} BPM, but a steady "
+                      f"{measured:.2f} BPM grid fits the onsets better, so {measured:.2f} is used. "
+                      f"To keep the tracker's tempo, re-run with --bpm-hint {round(tracked, 2):g}.")
 
 
 def check_hint(env, fps, hint):
@@ -417,12 +448,8 @@ def group_letter(group_id):
     return _GROUP_LETTERS[group_id % len(_GROUP_LETTERS)]
 
 def tempo_warning(tracked, pulse):
-    ratio = pulse / tracked
-    octave = ''
-    if abs(ratio / 2 - 1) <= TEMPO_TOLERANCE:
-        octave = ' (double)'
-    elif abs(ratio * 2 - 1) <= TEMPO_TOLERANCE:
-        octave = ' (half)'
+    octave = octave_relation(tracked, pulse)
+    octave = f' ({octave})' if octave else ''
     hint = f"{round(pulse, 2):g}"
     return (f"WARNING: the beat tracker locked onto {tracked:.2f} BPM, but the strongest "
             f"repeating pulse in the audio is {pulse:.2f} BPM{octave}. If {hint} sounds "
@@ -455,8 +482,8 @@ def grid_note(info):
             f"{int(m)}:{s:04.1f} = bar {info['entry_bar']}, beat 1 — {start}.")
 
 
-def print_report(tempo, segments, beats_per_bar, notes=(), pinned=False):
-    print(f"Tempo: {tempo:.2f} BPM{' (pinned with --bpm-hint)' if pinned else ''}")
+def print_report(tempo, segments, beats_per_bar, notes=(), tempo_source=''):
+    print(f"Tempo: {tempo:.2f} BPM{tempo_source}")
     for note in notes:
         print(note)
     print(f"Time signature assumed: {beats_per_bar}/4\n")
@@ -475,27 +502,37 @@ def print_report(tempo, segments, beats_per_bar, notes=(), pinned=False):
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def analyze(path, n_sections, beats_per_bar, bpm_hint, anchor=True):
-    """Returns (tempo, segments, notes) — notes are lines for the report header."""
+    """
+    Returns (tempo, segments, notes, tempo_source): notes are lines for the
+    report header, tempo_source says where the tempo came from.
+    """
     if not os.path.exists(path):
         raise FileNotFoundError(f"No such file: {path}")
     y, sr = librosa.load(path)
     tracked, beat_frames, beat_times = detect_beats(y, sr, bpm_hint)
     env, fps = comb_envelope(y, sr)
 
-    warnings = []
+    warnings, tempo_source = [], ''
     if bpm_hint:
         # A pinned tempo is used as given, but say so if the audio disagrees.
-        tempo = bpm_hint
+        tempo, tempo_source = bpm_hint, ' (pinned with --bpm-hint)'
         nearest = check_hint(env, fps, bpm_hint)
         if nearest is not None:
             warnings.append(hint_warning(bpm_hint, nearest, len(y) / sr))
     else:
-        # Refining stays within ±5% of what the tracker found: it removes
-        # lag-bin rounding, it doesn't second-guess the tracker's choice.
+        # Refining stays within ±5% of what the tracker found (it removes
+        # lag-bin rounding); a disagreement with the independent measurement
+        # is settled by resolve_tempo.
         tempo = refine_tempo(env, fps, tracked) if anchor else tracked
-        alt_tempo = check_tempo(y, sr, env, fps, tempo)
-        if alt_tempo is not None:
-            warnings.append(tempo_warning(tempo, alt_tempo))
+        measured = check_tempo(y, sr, env, fps, tempo)
+        if measured is not None:
+            resolved, line = resolve_tempo(env, fps, tempo, measured)
+            warnings.append(line)
+            if resolved != tempo:
+                tempo_source = f' (measured; the beat tracker said {tempo:.2f})'
+                tempo = resolved
+                if not anchor:
+                    _, beat_frames, beat_times = detect_beats(y, sr, tempo)
 
     if anchor:
         _, phase = comb_fit(env, fps, [tempo])
@@ -514,7 +551,7 @@ def analyze(path, n_sections, beats_per_bar, bpm_hint, anchor=True):
     labels = segment_bars(y, sr, bar_frames, n_sections)
     segments = labels_to_bar_boundaries(labels, len(bars))
     segments = annotate_energy(segments, y, sr, bars, beats_per_bar)
-    return tempo, segments, notes
+    return tempo, segments, notes, tempo_source
 
 
 def write_structure_json(path, tempo, segments, beats_per_bar):
@@ -555,13 +592,13 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     try:
-        tempo, segments, notes = analyze(args.path, args.sections, args.beats_per_bar,
-                                         args.bpm_hint, anchor=not args.no_anchor)
+        tempo, segments, notes, tempo_source = analyze(
+            args.path, args.sections, args.beats_per_bar, args.bpm_hint, anchor=not args.no_anchor)
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
 
-    print_report(tempo, segments, args.beats_per_bar, notes, pinned=bool(args.bpm_hint))
+    print_report(tempo, segments, args.beats_per_bar, notes, tempo_source)
 
     if args.write:
         write_structure_json(args.write, tempo, segments, args.beats_per_bar)
