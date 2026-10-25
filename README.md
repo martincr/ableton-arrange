@@ -180,5 +180,5 @@ It never guesses section *names* — a segmentation algorithm can tell you "thes
 
 Known limitations — see the script's own docstring for the full list:
 - No downbeat detection; bar 1 is assumed to be the first detected beat
-- `--sections` needs hand-tuning (start around 6–8)
-- BPM detection can octave-error on electronic music; use `--bpm-hint` if the reported tempo is clearly half or double the real one
+- `--sections` is the number of distinct section *types* (repetition groups), not the number of rows — types recur, so 6 can produce 15–20 rows on a long track. Needs hand-tuning; start around 4–8
+- The beat tracker can lock onto the wrong tempo — not only half/double, but e.g. 4/5 of the real tempo on delay-heavy dub techno. `--bpm-hint` pins the tempo; use it if the reported BPM sounds wrong

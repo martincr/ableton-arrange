@@ -27,11 +27,14 @@ Limitations (read before trusting the output):
 - Section *boundaries* and repetition *groups* are algorithmic. Section
   *names* are never inferred — this script does not claim to know what a
   "drop" sounds like.
-- --sections needs hand-tuning: too low under-segments, too high fragments
-  the track into slivers. Start around 6-8 and adjust.
-- BPM detection can octave-error (report half or double the real tempo,
-  common on electronic music) — use --bpm-hint if the reported tempo is
-  obviously wrong.
+- --sections is the number of distinct section *types* (repetition groups),
+  not the number of rows: types recur, so 6 types can produce 15-20 rows on a
+  long track. Too low merges different material; too high fragments the
+  track into slivers. Start around 4-8 and adjust.
+- The beat tracker can lock onto the wrong tempo — not only half/double, but
+  e.g. 4/5 of the real tempo on delay-heavy dub techno, where an echo pattern
+  can out-score the kick. Use --bpm-hint to pin the tempo if the reported BPM
+  sounds wrong.
 - MP3 support depends on the installed soundfile/libsndfile build actually
   including MP3 decoding (libsndfile >= 1.1.0). No ffmpeg dependency either way.
 - Segments shorter than 2 bars are folded into a neighbor rather than shown
@@ -55,8 +58,14 @@ from sklearn.cluster import KMeans
 # ── Beat / bar grid ─────────────────────────────────────────────────────────
 
 def detect_beats(y, sr, bpm_hint):
+    # trim=False keeps the grid running through soft or beatless passages at
+    # either end — with the default trim=True a quiet intro is dropped from the
+    # grid entirely (the first 1:47 of a 10-minute track, in testing). A hint
+    # is passed as bpm= to pin the tempo: start_bpm is only a prior, and the
+    # tracker can ignore it and lock onto a wrong tempo regardless.
+    kwargs = {'bpm': bpm_hint} if bpm_hint else {}
     tempo, beat_frames = librosa.beat.beat_track(
-        y=y, sr=sr, start_bpm=bpm_hint or 120.0, units='frames'
+        y=y, sr=sr, trim=False, units='frames', **kwargs
     )
     tempo = float(np.asarray(tempo).item())
     beat_times = librosa.frames_to_time(beat_frames, sr=sr)
@@ -94,9 +103,23 @@ def build_bar_grid(beat_frames, beat_times, beats_per_bar):
 # features make that class of error structurally impossible, and as a bonus
 # every cluster boundary is already bar-aligned — no snapping step needed.
 
+def sync_to_bars(data, bar_frames, **kwargs):
+    """
+    Aggregate frame-level features to exactly one column per bar.
+
+    librosa.util.sync's default pad=True adds frame 0 as a boundary, which
+    prepends a "pre-roll" column covering the audio *before* the first beat —
+    so column 0 is not bar 1, and every column after it is shifted by one.
+    Syncing on [bar starts..., end of data] with pad=False gives column i =
+    bar i+1, with the last bar running to the end of the audio.
+    """
+    idx = np.append(bar_frames, data.shape[-1])
+    return librosa.util.sync(data, idx, pad=False, **kwargs)
+
+
 def segment_bars(y, sr, bar_frames, n_sections):
     C = np.abs(librosa.cqt(y=y, sr=sr))
-    Csync = librosa.util.sync(C, bar_frames, aggregate=np.median)
+    Csync = sync_to_bars(C, bar_frames, aggregate=np.median)
 
     # Repetition (recurrence) affinity from bar-synchronous CQT
     R = librosa.segment.recurrence_matrix(
@@ -107,7 +130,7 @@ def segment_bars(y, sr, bar_frames, n_sections):
 
     # Local-path similarity from bar-synchronous MFCCs
     mfcc = librosa.feature.mfcc(y=y, sr=sr)
-    Msync = librosa.util.sync(mfcc, bar_frames)
+    Msync = sync_to_bars(mfcc, bar_frames)
     path_distance = np.sum(np.diff(Msync, axis=1) ** 2, axis=0)
     sigma = np.median(path_distance)
     path_sim = np.exp(-path_distance / (sigma + 1e-12))
@@ -135,12 +158,12 @@ def labels_to_bar_boundaries(labels, total_bars):
     """
     Turn a per-bar cluster label array into contiguous segments.
 
-    labels[i] is the cluster for bar (i+1); since features were bar-synced,
-    every run boundary is already bar-aligned, so this is just a run-length
-    grouping — no snapping needed. labels may have one extra trailing entry
-    from librosa.util.sync's boundary padding, which is dropped.
+    labels[i] is the cluster for bar (i+1) — sync_to_bars guarantees exactly
+    one label per bar — so every run boundary is already bar-aligned and this
+    is just a run-length grouping, no snapping needed.
     """
-    labels = labels[:total_bars]
+    if len(labels) != total_bars:
+        raise ValueError(f"expected {total_bars} bar labels, got {len(labels)}")
     segments = []
     seg_start = 0
     for i in range(1, len(labels) + 1):
@@ -190,24 +213,30 @@ def annotate_energy(segments, y, sr, bars, beats_per_bar):
     rms_times = librosa.frames_to_time(np.arange(len(rms)), sr=sr, hop_length=512)
     rms_norm = rms / (rms.max() + 1e-12)
 
-    bar_time = {b['bar']: b['time'] for b in bars}
-    total_bars = bars[-1]['bar'] if bars else 1
+    end_time = len(y) / sr
+    bar_edges = [b['time'] for b in bars] + [end_time]
+    bar_energy = []
+    for t0, t1 in zip(bar_edges[:-1], bar_edges[1:]):
+        vals = rms_norm[(rms_times >= t0) & (rms_times < t1)]
+        bar_energy.append(float(vals.mean()) if len(vals) else 0.0)
+    bar_energy = np.array(bar_energy)
 
     for seg in segments:
-        t0 = bar_time.get(seg['bar_start'], 0.0)
-        t1 = bar_time.get(seg['bar_end'], rms_times[-1] if len(rms_times) else t0)
-        mask = (rms_times >= t0) & (rms_times < t1)
-        vals = rms_norm[mask]
-        if len(vals) == 0:
+        per_bar = bar_energy[seg['bar_start'] - 1:seg['bar_end'] - 1]
+        if len(per_bar) == 0:
             seg['energy'] = 0.0
             seg['trend'] = 'flat'
             continue
-        seg['energy'] = round(float(vals.mean()), 2)
-        if len(vals) >= 4:
-            slope = np.polyfit(np.arange(len(vals)), vals, 1)[0]
-        else:
-            slope = 0.0
-        seg['trend'] = 'rising' if slope > 0.002 else 'falling' if slope < -0.002 else 'flat'
+        seg['energy'] = round(float(per_bar.mean()), 2)
+        # Fit the trend over per-bar means, then threshold the fitted change
+        # from first bar to last. Per-bar means ignore envelope shape *within*
+        # a bar (a stab decaying every bar is steady, not falling), and a
+        # whole-segment change is scale-free — a per-frame slope on ~23 ms RMS
+        # frames is too small to ever cross a fixed threshold.
+        change = 0.0
+        if len(per_bar) >= 2:
+            change = np.polyfit(np.arange(len(per_bar)), per_bar, 1)[0] * (len(per_bar) - 1)
+        seg['trend'] = 'rising' if change > 0.05 else 'falling' if change < -0.05 else 'flat'
     return segments
 
 
@@ -275,11 +304,14 @@ if __name__ == '__main__':
         epilog='This proposes boundaries and repetition groups; it does not name sections.')
     parser.add_argument('path', help='Audio file (WAV or MP3)')
     parser.add_argument('--sections', type=int, default=6,
-                        help='Target number of structural segments (default: 6)')
+                        help='Number of distinct section types (repetition groups) to '
+                             'cluster into (default: 6). Types recur, so the report '
+                             'usually lists more rows than this')
     parser.add_argument('--time-signature', type=int, default=4, dest='beats_per_bar',
                         help='Beats per bar (default: 4)')
     parser.add_argument('--bpm-hint', type=float, default=None,
-                        help='Prior tempo estimate, for when auto-detection octave-errors')
+                        help='Pin the tempo to this BPM, for when auto-detection '
+                             'locks onto the wrong one')
     parser.add_argument('--write', metavar='PATH', default=None,
                         help='Also write a structure.json skeleton with placeholder names')
     args = parser.parse_args()
