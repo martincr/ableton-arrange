@@ -176,9 +176,12 @@ python3 analyze_audio.py song.wav
 python3 analyze_audio.py song.mp3 --sections 6 --time-signature 4 --write structure.json
 ```
 
-It never guesses section *names* — a segmentation algorithm can tell you "these two sections look alike," not "this one is the drop." Without `--write` it only prints a report; with `--write` it emits a `structure.json` skeleton with placeholder names (`section_1`, `section_2`, ...) that you rename by ear before running `arrangement_tool.py`.
+It never guesses section *names* — a segmentation algorithm can tell you "these two sections look alike," not "this one is the drop." Without `--write` it only prints a report; with `--write` it emits a `structure.json` skeleton with placeholder names (`section_1`, `section_2`, ...) that you rename by ear before running `arrangement_tool.py`. Each row also shows its energy relative to the track itself (0 = the track's quietest bars, 1 = its loudest, so a compressed master still spreads across the scale), an energy trend, and whether its start boundary is firm.
+
+The bar grid is a single steady-tempo grid fitted to the whole track, with the downbeat anchored on the groove entry (the first sustained rise in low-end energy and onsets) and bars counted back from there. The report tells you where it anchored and where the audio starts relative to bar 1 — e.g. "anchored on the groove entry at 2:03.9 = bar 64, beat 1 — the audio starts on bar 1" — so you can line the audio up in Ableton.
 
 Known limitations — see the script's own docstring for the full list:
-- No downbeat detection; bar 1 is assumed to be the first detected beat
-- `--sections` needs hand-tuning (start around 6–8)
-- BPM detection can octave-error on electronic music; use `--bpm-hint` if the reported tempo is clearly half or double the real one
+- The grid assumes a fixed tempo and that the groove comes in on a downbeat. For music played live, or a groove that enters on a pickup, use `--no-anchor` (beat tracker's beats, bar 1 = first detected beat)
+- Boundaries inside slowly evolving passages can move with tiny changes to the bar grid. The report re-checks each one against 12 re-runs with the grid nudged by a frame and marks it `firm` or `moves (n/12)` — treat the ones that move as approximate
+- `--sections` is the number of distinct section *types* (repetition groups), not the number of rows — types recur, so 6 can produce 15–20 rows on a long track. Needs hand-tuning; start around 4–8
+- The beat tracker can lock onto the wrong tempo — not only half/double, but e.g. 4/5 of the real tempo on delay-heavy dub techno. When the tracked tempo disagrees with an independent measurement, the measured tempo is used automatically if a steady grid at it fits the audio better, and the report says so. Half/double disagreements only print a warning with a suggested `--bpm-hint` value, since the fit can't tell those apart. `--bpm-hint` pins the tempo, and is itself checked against the audio — a value copied from a BPM website can be off. Check by ear either way
