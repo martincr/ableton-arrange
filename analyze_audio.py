@@ -31,6 +31,10 @@ Limitations (read before trusting the output):
 - Section *boundaries* and repetition *groups* are algorithmic. Section
   *names* are never inferred — this script does not claim to know what a
   "drop" sounds like.
+- Boundaries inside slowly evolving passages are fragile: nudging the bar
+  grid by a frame can move or remove them. Each boundary is re-checked
+  against 12 such re-runs and shown as "firm" or "moves (n/12)" — treat the
+  ones that move as approximate.
 - --sections is the number of distinct section *types* (repetition groups),
   not the number of rows: types recur, so 6 types can produce 15-20 rows on a
   long track. Too low merges different material; too high fragments the
@@ -317,8 +321,12 @@ def sync_to_bars(data, bar_frames, **kwargs):
     return librosa.util.sync(data, idx, pad=False, **kwargs)
 
 
-def segment_bars(y, sr, bar_frames, n_sections):
-    C = np.abs(librosa.cqt(y=y, sr=sr))
+def segment_features(y, sr):
+    """Frame-level CQT and MFCCs — the expensive part, computed once per track."""
+    return np.abs(librosa.cqt(y=y, sr=sr)), librosa.feature.mfcc(y=y, sr=sr)
+
+
+def segment_bars(C, mfcc, bar_frames, n_sections):
     Csync = sync_to_bars(C, bar_frames, aggregate=np.median)
 
     # Repetition (recurrence) affinity from bar-synchronous CQT
@@ -329,7 +337,6 @@ def segment_bars(y, sr, bar_frames, n_sections):
     Rf = df(R, size=(1, 7))
 
     # Local-path similarity from bar-synchronous MFCCs
-    mfcc = librosa.feature.mfcc(y=y, sr=sr)
     Msync = sync_to_bars(mfcc, bar_frames)
     path_distance = np.sum(np.diff(Msync, axis=1) ** 2, axis=0)
     sigma = np.median(path_distance)
@@ -403,6 +410,49 @@ def merge_short_segments(segments, min_bars=2):
             del segments[i]
             changed = True
             break
+    return segments
+
+
+STABILITY_FIRM = 0.9   # a boundary that holds in >= 90% of re-runs is reported as firm
+
+
+def bar_times_to_frames(times, sr):
+    frames = librosa.time_to_frames(np.maximum(times, 0.0), sr=sr)
+    for i in range(1, len(frames)):          # keep one column per bar after rounding
+        frames[i] = max(frames[i], frames[i - 1] + 1)
+    return frames
+
+
+def boundary_stability(C, mfcc, bars, sr, n_sections, segments):
+    """
+    Mark each segment's start boundary with how often it survives re-runs.
+
+    Re-segments 12 times with the bar grid nudged the way tiny tempo
+    differences nudge it — bar times scaled by ±0.0005-0.002% (which shifts
+    the frame rounding of some bars and not others), and each bar moved by a
+    random -1/0/+1 frame (fixed seed, so the report is deterministic) — and
+    counts the re-runs with a boundary within one bar of each reported one.
+    Stores seg['stable'] = (agree, runs) on every segment but the first.
+
+    Shifting the whole grid uniformly, or changing KMeans seeds, never moved
+    a boundary in testing, while a 0.0004% tempo difference moved splits
+    inside a gradual breakdown — so it's uneven rounding that's modelled.
+    Varying --sections is deliberately not: asking for fewer section types
+    than a track has removes boundaries that are correct.
+    """
+    times = np.array([b['time'] for b in bars])
+    rng = np.random.default_rng(0)
+    variants = [times[0] + (times - times[0]) * (1 + e)
+                for e in (-2e-5, -1e-5, -5e-6, 5e-6, 1e-5, 2e-5)]
+    variants += [times + rng.integers(-1, 2, len(times)) * 512 / sr for _ in range(6)]
+
+    runs = []
+    for v in variants:
+        labels = segment_bars(C, mfcc, bar_times_to_frames(v, sr), n_sections)
+        runs.append([s['bar_start'] for s in labels_to_bar_boundaries(labels, len(bars))[1:]])
+    for seg in segments[1:]:
+        agree = sum(any(abs(seg['bar_start'] - b) <= 1 for b in run) for run in runs)
+        seg['stable'] = (agree, len(runs))
     return segments
 
 
@@ -482,18 +532,31 @@ def grid_note(info):
             f"{int(m)}:{s:04.1f} = bar {info['entry_bar']}, beat 1 — {start}.")
 
 
+def boundary_label(seg):
+    if 'stable' not in seg:
+        return '—'
+    agree, runs = seg['stable']
+    return 'firm' if agree >= STABILITY_FIRM * runs else f'moves ({agree}/{runs})'
+
+
 def print_report(tempo, segments, beats_per_bar, notes=(), tempo_source=''):
     print(f"Tempo: {tempo:.2f} BPM{tempo_source}")
     for note in notes:
         print(note)
     print(f"Time signature assumed: {beats_per_bar}/4\n")
-    print(f"{'#':<4} {'Bars':<12} {'Length':<9} {'Energy':<8} {'Trend':<9} {'Group'}")
-    print('-' * 55)
+    print(f"{'#':<4} {'Bars':<12} {'Length':<9} {'Energy':<8} {'Trend':<9} {'Group':<7} {'Boundary'}")
+    print('-' * 67)
     for i, seg in enumerate(segments, 1):
         length = seg['bar_end'] - seg['bar_start']
         bars_str = f"{seg['bar_start']}–{seg['bar_end']}"
-        print(f"{i:<4} {bars_str:<12} {length:<9} {seg['energy']:<8} {seg['trend']:<9} {group_letter(seg['group'])}")
+        print(f"{i:<4} {bars_str:<12} {length:<9} {seg['energy']:<8} {seg['trend']:<9} "
+              f"{group_letter(seg['group']):<7} {boundary_label(seg)}")
     print()
+    if any(seg.get('stable') for seg in segments):
+        runs = next(seg['stable'][1] for seg in segments if seg.get('stable'))
+        print(f"Boundary = whether the row's start held when the analysis was re-run {runs} times")
+        print("with the bar grid nudged by a frame (as tiny tempo differences do). 'moves'")
+        print("means some re-runs put it elsewhere or dropped it — treat it as approximate.\n")
     print("Sections sharing a Group letter look structurally similar (likely repeats,")
     print("e.g. two drops). Nothing has been written — use --write to also emit a")
     print("structure.json skeleton with placeholder names for you to rename by ear.")
@@ -548,8 +611,10 @@ def analyze(path, n_sections, beats_per_bar, bpm_hint, anchor=True):
         )
 
     bar_frames = np.array([b['frame'] for b in bars])
-    labels = segment_bars(y, sr, bar_frames, n_sections)
+    C, mfcc = segment_features(y, sr)
+    labels = segment_bars(C, mfcc, bar_frames, n_sections)
     segments = labels_to_bar_boundaries(labels, len(bars))
+    segments = boundary_stability(C, mfcc, bars, sr, n_sections, segments)
     segments = annotate_energy(segments, y, sr, bars, beats_per_bar)
     return tempo, segments, notes, tempo_source
 
