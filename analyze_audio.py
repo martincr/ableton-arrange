@@ -44,8 +44,12 @@ Limitations (read before trusting the output):
   can out-score the kick. When the tracked tempo disagrees with an
   independent measurement, the measured tempo is used automatically if a
   steady grid at it fits the onsets better (the report says so). Half/double
-  disagreements only print a WARNING: a half-tempo grid can fit better than
-  the true one, so the fit can't settle them. --bpm-hint pins the tempo, and
+  disagreements are settled automatically when only one of the two tempos
+  is in the usual 70-180 BPM range; when both are (87 vs 174, 70 vs 140) the
+  report only warns, since nothing measured tells those apart reliably. Music
+  genuinely outside 70-180 (gabber, slow ballads) needs --bpm-hint. And if the
+  tracker and the measurement agree on the wrong octave, nothing flags it.
+  --bpm-hint pins the tempo, and
   is itself checked against the audio (a hint copied from a BPM website can
   be off). Tempi are refined to ~0.01 BPM by fitting steady
   grids to the onsets, so they aren't rounded to librosa's coarse lag steps.
@@ -159,17 +163,38 @@ def octave_relation(tracked, measured):
     return ''
 
 
+PLAUSIBLE_BPM = (70.0, 180.0)  # where produced music's tempo almost always sits
+
+
 def resolve_tempo(env, fps, tracked, measured):
     """
     Choose between the tracker's tempo and the independent measurement when
     they disagree. Returns (tempo, report line).
 
-    Switches to `measured` when its steady grid fits the onsets better than
-    `tracked`'s. Half/double disagreements only warn: a grid at half the true
-    tempo lands on just the strongest hits and can fit *better* (61 BPM
-    outscored the real 122 on "Transport"), so the fit can't settle them.
+    A half/double disagreement is settled by range: if only one of the two
+    tempos lies in PLAUSIBLE_BPM, that one is used (61 vs 122, 122 vs 244).
+    If both do (87 vs 174, 70 vs 140), it stays a warning, because nothing
+    measured separates them: a grid fit prefers the slower octave (61 BPM
+    outscored the real 122 on "Transport"), and checking whether the points
+    between beats carry hits got synthetic hip-hop and half-time dubstep
+    loops backwards — hats on every 8th note make them as strong as beats.
+
+    Any other disagreement switches to `measured` when its steady grid fits
+    the onsets better than `tracked`'s.
     """
-    if octave_relation(tracked, measured) or grid_fit(env, fps, measured)[0] <= grid_fit(env, fps, tracked)[0]:
+    octave = octave_relation(tracked, measured)
+    if octave:
+        lo, hi = PLAUSIBLE_BPM
+        in_range = [t for t in (tracked, measured) if lo <= t <= hi]
+        if len(in_range) != 1:
+            return tracked, tempo_warning(tracked, measured)
+        chosen = in_range[0]
+        other = measured if chosen == tracked else tracked
+        return chosen, (f"NOTE: the beat tracker said {tracked:.2f} BPM and the measurement "
+                        f"{measured:.2f} — one is {'double' if octave == 'double' else 'half'} the "
+                        f"other. Using {chosen:.2f}, the only one in the usual {lo:.0f}-{hi:.0f} BPM "
+                        f"range. If {other:.2f} is right, re-run with --bpm-hint {round(other, 2):g}.")
+    if grid_fit(env, fps, measured)[0] <= grid_fit(env, fps, tracked)[0]:
         return tracked, tempo_warning(tracked, measured)
     return measured, (f"NOTE: the beat tracker locked onto {tracked:.2f} BPM, but a steady "
                       f"{measured:.2f} BPM grid fits the onsets better, so {measured:.2f} is used. "
