@@ -21,9 +21,13 @@ Requires: numpy, scipy, scikit-learn, librosa<1.0.0, soundfile
 line automatically on earlier interpreters.)
 
 Limitations (read before trusting the output):
-- Bar 1 / downbeat alignment is a simplifying assumption (first detected beat
-  = beat 1 of bar 1), not a detected downbeat. There is no downbeat model
-  here — nudge the result by hand if the grid is visibly off.
+- The bar grid assumes a fixed tempo: one steady grid is fitted to the whole
+  track, and the groove entry (first sustained rise in low-end energy and
+  onsets) is taken as a downbeat, with bars counted back from it. That suits
+  electronic music; for anything played live, or if the entry is really a
+  pickup (e.g. the groove comes in on beat 3), use --no-anchor to get the
+  beat tracker's beats with bar 1 = first detected beat. The report says
+  where it anchored — check that bar line by ear.
 - Section *boundaries* and repetition *groups* are algorithmic. Section
   *names* are never inferred — this script does not claim to know what a
   "drop" sounds like.
@@ -35,7 +39,10 @@ Limitations (read before trusting the output):
   e.g. 4/5 of the real tempo on delay-heavy dub techno, where an echo pattern
   can out-score the kick. The report prints a WARNING when the tracked tempo
   disagrees with an independent estimate, suggesting a value; --bpm-hint pins
-  the tempo. Check by ear either way — the warning can't tell which is right.
+  the tempo, and is itself checked against the audio (a hint copied from a
+  BPM website can be off). Tempi are refined to ~0.01 BPM by fitting steady
+  grids to the onsets, so they aren't rounded to librosa's coarse lag steps.
+  Check by ear either way — the warnings can't tell which value is right.
 - MP3 support depends on the installed soundfile/libsndfile build actually
   including MP3 decoding (libsndfile >= 1.1.0). No ffmpeg dependency either way.
 - Segments shorter than 2 bars are folded into a neighbor rather than shown
@@ -56,7 +63,7 @@ from scipy.linalg import eigh as scipy_eigh
 from sklearn.cluster import KMeans
 
 
-# ── Beat / bar grid ─────────────────────────────────────────────────────────
+# ── Tempo ────────────────────────────────────────────────────────────────────
 
 def detect_beats(y, sr, bpm_hint):
     # trim=False keeps the grid running through soft or beatless passages at
@@ -73,30 +80,172 @@ def detect_beats(y, sr, bpm_hint):
     return tempo, beat_frames, beat_times
 
 
-TEMPO_TOLERANCE = 0.04  # relative; small tracking errors (~2%) don't warrant a warning
+COMB_HOP = 128           # ~5.8 ms frames, fine enough to resolve tempo between lag bins
+TEMPO_TOLERANCE = 0.04   # relative; small tracking errors (~2%) don't warrant a warning
+HINT_TOLERANCE = 0.001   # a pinned tempo 0.1% off drifts about a beat over a 10-minute track
 
 
-def check_tempo(y, sr, tracked):
+def comb_envelope(y, sr):
+    return librosa.onset.onset_strength(y=y, sr=sr, hop_length=COMB_HOP), sr / COMB_HOP
+
+
+def comb_fit(env, fps, bpms):
+    """
+    Best constant-tempo grid among candidate BPMs, as (bpm, phase_seconds).
+
+    For each candidate, slides a fixed grid across the onset envelope in
+    half-frame phase steps and scores the mean onset strength on the grid. A
+    wrong tempo drifts out of phase within a few bars, so over a whole track
+    the true one stands out sharply. librosa's own estimates snap to whole
+    frame lags — near 120 BPM the only values available are 117.5, 123.0 and
+    129.2 — which is how a track at exactly 122.00 came out as "123".
+    """
+    best_score, best_bpm, best_phase = -1.0, None, None
+    for bpm in bpms:
+        period = 60.0 / bpm * fps
+        n = int((len(env) - 1 - period) // period)
+        if n < 2:
+            continue
+        phases = np.arange(0, period, 0.5)
+        idx = np.round(phases[:, None] + period * np.arange(n)[None, :]).astype(int)
+        scores = env[idx].mean(axis=1)
+        if scores.max() > best_score:
+            best_score = scores.max()
+            best_bpm, best_phase = float(bpm), phases[scores.argmax()] / fps
+    if best_bpm is None:
+        raise ValueError("Audio too short to fit a tempo")
+    return best_bpm, best_phase
+
+
+def refine_tempo(env, fps, bpm, span=0.05):
+    """The steadiest tempo within ±span of `bpm`, to 0.005 BPM."""
+    coarse, _ = comb_fit(env, fps, np.arange(bpm * (1 - span), bpm * (1 + span), 0.05))
+    fine, _ = comb_fit(env, fps, np.arange(coarse - 0.06, coarse + 0.06, 0.005))
+    return fine
+
+
+def check_tempo(y, sr, env, fps, tracked):
     """
     Cross-check the tracked tempo against an independent estimate.
 
     Returns the independent estimate if it disagrees with `tracked` by more
     than TEMPO_TOLERANCE, else None. beat_track builds its onset envelope with
     median aggregation, which on reverb-heavy material can favour an echo
-    pattern over the kick (99.4 vs a real 123 BPM, in testing). This uses the
+    pattern over the kick (99.4 vs a real 122 BPM, in testing). This uses the
     default mean-aggregated envelope instead — an estimate from the median
-    envelope just repeats the tracker's mistake.
+    envelope just repeats the tracker's mistake — refined with comb_fit so the
+    suggested value isn't stuck on a lag bin.
     """
     oenv = librosa.onset.onset_strength(y=y, sr=sr)
-    pulse = float(librosa.feature.tempo(onset_envelope=oenv, sr=sr)[0])
+    pulse = refine_tempo(env, fps, float(librosa.feature.tempo(onset_envelope=oenv, sr=sr)[0]))
     return None if abs(tracked / pulse - 1) <= TEMPO_TOLERANCE else pulse
+
+
+def check_hint(env, fps, hint):
+    """The nearest steady tempo if a pinned --bpm-hint drifts against the audio, else None."""
+    nearest = refine_tempo(env, fps, hint)
+    return None if abs(nearest / hint - 1) <= HINT_TOLERANCE else nearest
+
+
+# ── Bar grid ─────────────────────────────────────────────────────────────────
+
+def find_groove_entry(y, sr, beat_times, win=16):
+    """
+    Index into beat_times of the beat where the groove first comes in, or None.
+
+    "Groove" is low-end energy (30-120 Hz, where kick and bass sit) plus onset
+    strength, each normalised over the track and averaged per beat. The entry
+    is the first sustained rise at least half the size of the track's biggest:
+    compare the median of the `win` beats after each beat with the `win`
+    before, take the first beat whose rise reaches half the largest, then
+    localise to the first two beats in a row above the midpoint of the levels
+    either side. (The median comparison alone is flat-topped across a
+    transition, so its peak lands early.) Low-end energy on its own isn't
+    enough: a dub bass pulsing through a beatless intro reaches the kick's
+    level on alternate beats.
+    """
+    S = np.abs(librosa.stft(y)) ** 2
+    freqs = librosa.fft_frequencies(sr=sr)
+    low_db = 10 * np.log10(S[(freqs >= 30) & (freqs <= 120)].sum(axis=0) + 1e-10)
+    oenv = librosa.onset.onset_strength(y=y, sr=sr)
+    n = min(len(low_db), len(oenv))
+    t = librosa.frames_to_time(np.arange(n), sr=sr)
+    starts = np.searchsorted(t, beat_times)
+    ends = np.append(starts[1:], n)
+
+    def per_beat(curve):
+        return np.array([curve[a:b].mean() if b > a else curve[min(a, n - 1)]
+                         for a, b in zip(starts, ends)])
+
+    def z(v):
+        return (v - v.mean()) / (v.std() + 1e-12)
+
+    inten = z(per_beat(low_db[:n])) + z(per_beat(oenv[:n]))
+    if len(inten) < 3 * win:
+        return None
+    step = np.full(len(inten), -np.inf)
+    for i in range(win, len(inten) - win):
+        step[i] = np.median(inten[i:i + win]) - np.median(inten[i - win:i])
+    largest = step.max()
+    if largest < 1.0:   # no step worth calling an entry
+        return None
+    first = int(np.argmax(step >= 0.5 * largest))
+    c = first + int(np.argmax(step[first:first + win]))
+    mid = (np.median(inten[max(0, c - 24):c - 8]) + np.median(inten[c + 8:c + 24])) / 2
+    for i in range(max(1, c - 8), min(len(inten) - 1, c + 9)):
+        if inten[i] > mid and inten[i + 1] > mid:
+            return i
+    return c
+
+
+def anchored_bar_grid(y, sr, bpm, phase, beats_per_bar):
+    """
+    Constant-tempo bar grid with the bar lines anchored on the groove entry.
+
+    A beat tracker's beats drift wherever there's nothing to follow: through
+    a beatless intro it fitted 63 bars at 122.2 BPM in front of a kick that
+    runs at a steady 122.00. Electronic music sits on one fixed grid, so this
+    lays a constant grid (tempo and phase from comb_fit) over the whole track
+    and makes the groove entry a downbeat. Bars are counted back from the
+    entry to the start of the audio: audio before the first full bar becomes
+    a pickup bar 1 if it holds at least one beat, and is left off the grid if
+    not. With no clear entry, the first beat on the grid is the downbeat.
+
+    Returns (bars, info): bars as in build_bar_grid (bar 1 may start before
+    the audio, at a negative time), and info with the beat period, the
+    entry's time and bar number (None if no entry was found), and where bar 1
+    starts.
+    """
+    period = 60.0 / bpm
+    duration = len(y) / sr
+    beat_times = np.arange(phase, duration, period)
+    entry = find_groove_entry(y, sr, beat_times)
+    anchor = beat_times[entry] if entry is not None else beat_times[0]
+
+    bar_len = beats_per_bar * period
+    lead_in = anchor / period                       # beats of audio before the anchor
+    whole_bars = int(lead_in // beats_per_bar)
+    bars_before = whole_bars + (1 if lead_in - whole_bars * beats_per_bar >= 1.0 else 0)
+    bar1 = anchor - bars_before * bar_len
+
+    bars = []
+    while bar1 + len(bars) * bar_len < duration - period:   # each bar holds a beat or more
+        t = bar1 + len(bars) * bar_len
+        bars.append({'bar': len(bars) + 1, 'time': float(t),
+                     'frame': int(librosa.time_to_frames(max(t, 0.0), sr=sr))})
+    info = {
+        'period': period,
+        'bar1_time': float(bar1),
+        'entry_time': float(anchor) if entry is not None else None,
+        'entry_bar': bars_before + 1 if entry is not None else None,
+    }
+    return bars, info
 
 
 def build_bar_grid(beat_frames, beat_times, beats_per_bar):
     """
-    Group consecutive beats into bars. beat_frames[0] is treated as bar 1,
-    beat 1 — there is no downbeat detection, so this is a simplifying
-    assumption the caller should verify by ear.
+    Group the beat tracker's beats into bars (the --no-anchor grid).
+    beat_frames[0] is treated as bar 1, beat 1 — no downbeat detection.
 
     Returns a list of {"bar": int, "frame": int, "time": float} for each bar
     start (one entry per beats_per_bar-th beat).
@@ -274,16 +423,42 @@ def tempo_warning(tracked, pulse):
         octave = ' (double)'
     elif abs(ratio * 2 - 1) <= TEMPO_TOLERANCE:
         octave = ' (half)'
-    hint = f"{round(pulse, 1):g}"
-    return (f"WARNING: the beat tracker locked onto {tracked:.1f} BPM, but the strongest "
-            f"repeating pulse in the audio is {pulse:.1f} BPM{octave}. If {hint} sounds "
+    hint = f"{round(pulse, 2):g}"
+    return (f"WARNING: the beat tracker locked onto {tracked:.2f} BPM, but the strongest "
+            f"repeating pulse in the audio is {pulse:.2f} BPM{octave}. If {hint} sounds "
             f"right, re-run with --bpm-hint {hint} — a wrong tempo fragments the sections below.")
 
 
-def print_report(tempo, segments, beats_per_bar, alt_tempo=None):
-    print(f"Detected tempo: {tempo:.1f} BPM  (bar 1 = first detected beat — verify by ear)")
-    if alt_tempo is not None:
-        print(tempo_warning(tempo, alt_tempo))
+def hint_warning(hint, nearest, duration):
+    drift = abs(hint / nearest - 1) * duration * nearest / 60.0
+    return (f"WARNING: --bpm-hint {hint:g} doesn't hold against the audio — the closest "
+            f"steady tempo is {nearest:.2f} BPM, and a grid at {hint:g} drifts about "
+            f"{drift:.0f} beats over the track. Check by ear before trusting either.")
+
+
+def grid_note(info):
+    if info is None:
+        return "Bar grid: the beat tracker's beats, bar 1 = first detected beat (--no-anchor; verify by ear)."
+    bpm = 60.0 / info['period']
+    into = -info['bar1_time'] / info['period']      # beats of bar 1 before the audio starts
+    if abs(into) < 0.1:
+        start = "the audio starts on bar 1"
+    elif into > 0:
+        start = f"the audio starts {into:.1f} beats into bar 1"
+    else:
+        start = f"the first {-into:.1f} beats of audio sit before bar 1"
+    if info['entry_bar'] is None:
+        return (f"Bar grid: steady {bpm:.2f} BPM; no clear groove entry found, so bar 1 is the "
+                f"first beat on the grid — {start}. Verify the downbeat by ear.")
+    m, s = divmod(info['entry_time'], 60)
+    return (f"Bar grid: steady {bpm:.2f} BPM, anchored on the groove entry at "
+            f"{int(m)}:{s:04.1f} = bar {info['entry_bar']}, beat 1 — {start}.")
+
+
+def print_report(tempo, segments, beats_per_bar, notes=(), pinned=False):
+    print(f"Tempo: {tempo:.2f} BPM{' (pinned with --bpm-hint)' if pinned else ''}")
+    for note in notes:
+        print(note)
     print(f"Time signature assumed: {beats_per_bar}/4\n")
     print(f"{'#':<4} {'Bars':<12} {'Length':<9} {'Energy':<8} {'Trend':<9} {'Group'}")
     print('-' * 55)
@@ -299,14 +474,35 @@ def print_report(tempo, segments, beats_per_bar, alt_tempo=None):
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 
-def analyze(path, n_sections, beats_per_bar, bpm_hint):
+def analyze(path, n_sections, beats_per_bar, bpm_hint, anchor=True):
+    """Returns (tempo, segments, notes) — notes are lines for the report header."""
     if not os.path.exists(path):
         raise FileNotFoundError(f"No such file: {path}")
     y, sr = librosa.load(path)
-    tempo, beat_frames, beat_times = detect_beats(y, sr, bpm_hint)
-    # A pinned tempo is the user's call; only second-guess a detected one.
-    alt_tempo = None if bpm_hint else check_tempo(y, sr, tempo)
-    bars = build_bar_grid(beat_frames, beat_times, beats_per_bar)
+    tracked, beat_frames, beat_times = detect_beats(y, sr, bpm_hint)
+    env, fps = comb_envelope(y, sr)
+
+    warnings = []
+    if bpm_hint:
+        # A pinned tempo is used as given, but say so if the audio disagrees.
+        tempo = bpm_hint
+        nearest = check_hint(env, fps, bpm_hint)
+        if nearest is not None:
+            warnings.append(hint_warning(bpm_hint, nearest, len(y) / sr))
+    else:
+        # Refining stays within ±5% of what the tracker found: it removes
+        # lag-bin rounding, it doesn't second-guess the tracker's choice.
+        tempo = refine_tempo(env, fps, tracked) if anchor else tracked
+        alt_tempo = check_tempo(y, sr, env, fps, tempo)
+        if alt_tempo is not None:
+            warnings.append(tempo_warning(tempo, alt_tempo))
+
+    if anchor:
+        _, phase = comb_fit(env, fps, [tempo])
+        bars, info = anchored_bar_grid(y, sr, tempo, phase, beats_per_bar)
+    else:
+        bars, info = build_bar_grid(beat_frames, beat_times, beats_per_bar), None
+    notes = warnings + [grid_note(info)]
 
     if len(bars) < n_sections:
         raise ValueError(
@@ -318,12 +514,12 @@ def analyze(path, n_sections, beats_per_bar, bpm_hint):
     labels = segment_bars(y, sr, bar_frames, n_sections)
     segments = labels_to_bar_boundaries(labels, len(bars))
     segments = annotate_energy(segments, y, sr, bars, beats_per_bar)
-    return tempo, segments, alt_tempo
+    return tempo, segments, notes
 
 
 def write_structure_json(path, tempo, segments, beats_per_bar):
     cfg = {
-        'bpm': round(tempo, 1),
+        'bpm': round(tempo, 2),
         'time_signature': [beats_per_bar, 4],
         'structure': [
             {'section': f'section_{i}', 'bars': seg['bar_end'] - seg['bar_start']}
@@ -349,17 +545,23 @@ if __name__ == '__main__':
     parser.add_argument('--bpm-hint', type=float, default=None,
                         help='Pin the tempo to this BPM, for when auto-detection '
                              'locks onto the wrong one')
+    parser.add_argument('--no-anchor', action='store_true',
+                        help="Use the beat tracker's beats as the bar grid, with bar 1 = "
+                             "first detected beat, instead of a steady-tempo grid anchored "
+                             "on the groove entry — for music not on a fixed tempo, or if "
+                             "the anchor lands on the wrong beat")
     parser.add_argument('--write', metavar='PATH', default=None,
                         help='Also write a structure.json skeleton with placeholder names')
     args = parser.parse_args()
 
     try:
-        tempo, segments, alt_tempo = analyze(args.path, args.sections, args.beats_per_bar, args.bpm_hint)
+        tempo, segments, notes = analyze(args.path, args.sections, args.beats_per_bar,
+                                         args.bpm_hint, anchor=not args.no_anchor)
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
 
-    print_report(tempo, segments, args.beats_per_bar, alt_tempo)
+    print_report(tempo, segments, args.beats_per_bar, notes, pinned=bool(args.bpm_hint))
 
     if args.write:
         write_structure_json(args.write, tempo, segments, args.beats_per_bar)

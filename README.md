@@ -178,7 +178,9 @@ python3 analyze_audio.py song.mp3 --sections 6 --time-signature 4 --write struct
 
 It never guesses section *names* — a segmentation algorithm can tell you "these two sections look alike," not "this one is the drop." Without `--write` it only prints a report; with `--write` it emits a `structure.json` skeleton with placeholder names (`section_1`, `section_2`, ...) that you rename by ear before running `arrangement_tool.py`.
 
+The bar grid is a single steady-tempo grid fitted to the whole track, with the downbeat anchored on the groove entry (the first sustained rise in low-end energy and onsets) and bars counted back from there. The report tells you where it anchored and where the audio starts relative to bar 1 — e.g. "anchored on the groove entry at 2:03.9 = bar 64, beat 1 — the audio starts on bar 1" — so you can line the audio up in Ableton.
+
 Known limitations — see the script's own docstring for the full list:
-- No downbeat detection; bar 1 is assumed to be the first detected beat
+- The grid assumes a fixed tempo and that the groove comes in on a downbeat. For music played live, or a groove that enters on a pickup, use `--no-anchor` (beat tracker's beats, bar 1 = first detected beat)
 - `--sections` is the number of distinct section *types* (repetition groups), not the number of rows — types recur, so 6 can produce 15–20 rows on a long track. Needs hand-tuning; start around 4–8
-- The beat tracker can lock onto the wrong tempo — not only half/double, but e.g. 4/5 of the real tempo on delay-heavy dub techno. The report prints a warning, with a suggested `--bpm-hint` value, when the tracked tempo disagrees with an independent estimate; `--bpm-hint` pins the tempo. Check by ear either way
+- The beat tracker can lock onto the wrong tempo — not only half/double, but e.g. 4/5 of the real tempo on delay-heavy dub techno. The report prints a warning, with a suggested `--bpm-hint` value, when the tracked tempo disagrees with an independent estimate. `--bpm-hint` pins the tempo, and is itself checked against the audio — a value copied from a BPM website can be off. Check by ear either way
