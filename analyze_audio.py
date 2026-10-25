@@ -33,8 +33,9 @@ Limitations (read before trusting the output):
   track into slivers. Start around 4-8 and adjust.
 - The beat tracker can lock onto the wrong tempo — not only half/double, but
   e.g. 4/5 of the real tempo on delay-heavy dub techno, where an echo pattern
-  can out-score the kick. Use --bpm-hint to pin the tempo if the reported BPM
-  sounds wrong.
+  can out-score the kick. The report prints a WARNING when the tracked tempo
+  disagrees with an independent estimate, suggesting a value; --bpm-hint pins
+  the tempo. Check by ear either way — the warning can't tell which is right.
 - MP3 support depends on the installed soundfile/libsndfile build actually
   including MP3 decoding (libsndfile >= 1.1.0). No ffmpeg dependency either way.
 - Segments shorter than 2 bars are folded into a neighbor rather than shown
@@ -70,6 +71,25 @@ def detect_beats(y, sr, bpm_hint):
     tempo = float(np.asarray(tempo).item())
     beat_times = librosa.frames_to_time(beat_frames, sr=sr)
     return tempo, beat_frames, beat_times
+
+
+TEMPO_TOLERANCE = 0.04  # relative; small tracking errors (~2%) don't warrant a warning
+
+
+def check_tempo(y, sr, tracked):
+    """
+    Cross-check the tracked tempo against an independent estimate.
+
+    Returns the independent estimate if it disagrees with `tracked` by more
+    than TEMPO_TOLERANCE, else None. beat_track builds its onset envelope with
+    median aggregation, which on reverb-heavy material can favour an echo
+    pattern over the kick (99.4 vs a real 123 BPM, in testing). This uses the
+    default mean-aggregated envelope instead — an estimate from the median
+    envelope just repeats the tracker's mistake.
+    """
+    oenv = librosa.onset.onset_strength(y=y, sr=sr)
+    pulse = float(librosa.feature.tempo(onset_envelope=oenv, sr=sr)[0])
+    return None if abs(tracked / pulse - 1) <= TEMPO_TOLERANCE else pulse
 
 
 def build_bar_grid(beat_frames, beat_times, beats_per_bar):
@@ -247,8 +267,23 @@ _GROUP_LETTERS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
 def group_letter(group_id):
     return _GROUP_LETTERS[group_id % len(_GROUP_LETTERS)]
 
-def print_report(tempo, segments, beats_per_bar):
+def tempo_warning(tracked, pulse):
+    ratio = pulse / tracked
+    octave = ''
+    if abs(ratio / 2 - 1) <= TEMPO_TOLERANCE:
+        octave = ' (double)'
+    elif abs(ratio * 2 - 1) <= TEMPO_TOLERANCE:
+        octave = ' (half)'
+    hint = f"{round(pulse, 1):g}"
+    return (f"WARNING: the beat tracker locked onto {tracked:.1f} BPM, but the strongest "
+            f"repeating pulse in the audio is {pulse:.1f} BPM{octave}. If {hint} sounds "
+            f"right, re-run with --bpm-hint {hint} — a wrong tempo fragments the sections below.")
+
+
+def print_report(tempo, segments, beats_per_bar, alt_tempo=None):
     print(f"Detected tempo: {tempo:.1f} BPM  (bar 1 = first detected beat — verify by ear)")
+    if alt_tempo is not None:
+        print(tempo_warning(tempo, alt_tempo))
     print(f"Time signature assumed: {beats_per_bar}/4\n")
     print(f"{'#':<4} {'Bars':<12} {'Length':<9} {'Energy':<8} {'Trend':<9} {'Group'}")
     print('-' * 55)
@@ -269,6 +304,8 @@ def analyze(path, n_sections, beats_per_bar, bpm_hint):
         raise FileNotFoundError(f"No such file: {path}")
     y, sr = librosa.load(path)
     tempo, beat_frames, beat_times = detect_beats(y, sr, bpm_hint)
+    # A pinned tempo is the user's call; only second-guess a detected one.
+    alt_tempo = None if bpm_hint else check_tempo(y, sr, tempo)
     bars = build_bar_grid(beat_frames, beat_times, beats_per_bar)
 
     if len(bars) < n_sections:
@@ -281,7 +318,7 @@ def analyze(path, n_sections, beats_per_bar, bpm_hint):
     labels = segment_bars(y, sr, bar_frames, n_sections)
     segments = labels_to_bar_boundaries(labels, len(bars))
     segments = annotate_energy(segments, y, sr, bars, beats_per_bar)
-    return tempo, segments
+    return tempo, segments, alt_tempo
 
 
 def write_structure_json(path, tempo, segments, beats_per_bar):
@@ -317,12 +354,12 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     try:
-        tempo, segments = analyze(args.path, args.sections, args.beats_per_bar, args.bpm_hint)
+        tempo, segments, alt_tempo = analyze(args.path, args.sections, args.beats_per_bar, args.bpm_hint)
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
 
-    print_report(tempo, segments, args.beats_per_bar)
+    print_report(tempo, segments, args.beats_per_bar, alt_tempo)
 
     if args.write:
         write_structure_json(args.write, tempo, segments, args.beats_per_bar)
